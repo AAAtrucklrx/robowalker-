@@ -70,10 +70,18 @@ def main() -> int:
     c, r = (int(v) for v in args.pattern.lower().split("x"))
     spec = BoardSpec("chessboard", (c, r), args.square_mm / 1000.0)
 
+    # ⚠️ **深度多样性是内参可辨识的硬条件**，不是可选项。
+    # 受控实验（同一真值 fx=1100，只改深度跨度）：
+    #     跨度 1.0x（相机几乎不动）-> fx 偏 +4.17%，k3 跑到 -0.047
+    #     跨度 1.8x                -> fx 偏 -0.12%
+    #     跨度 3.3x                -> fx 偏 +0.31%，k1/k2/k3 全部接近真值
+    # 三种情况的**重投影误差都是 0.13~0.15 px** —— 光看残差发现不了简并。
+    # 所以这里刻意让 z 在 0.70~1.80 m 之间摆动（跨度 ~2.6x）。
     rig = SimRig(traj=Trajectory(rot_amp=np.array([0.20, 0.15, 0.26]),
                                  rot_freq=np.array([2.6, 3.6, 1.5]),
-                                 pos_amp=np.array([0.05, 0.04, 0.03]),
-                                 center=np.array([0.0, 0.0, 1.30]),
+                                 pos_amp=np.array([0.05, 0.04, 0.55]),
+                                 pos_freq=np.array([0.8, 1.2, 0.45]),
+                                 center=np.array([0.0, 0.0, 1.25]),
                                  lead_in_s=args.lead_in),
                  tau=args.tau)
     rig.K = np.array([[1100.0, 0, W / 2 - 12.0],
