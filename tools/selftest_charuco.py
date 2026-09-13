@@ -70,8 +70,15 @@ def render_view_from_texture(tex, mm2tex, spec, K, dist, rvec, tvec, image_size,
     valid = np.isfinite(p_b).all(axis=1) & (s > 0)
 
     # 板坐标(米) -> 纹理像素（mm2tex 由板自身的角点检测标定出来）
-    bx = p_b[:, 0] * 1000.0
-    by = p_b[:, 1] * 1000.0
+    #
+    # ⚠️ **必须补一个方格的平移**：两个坐标系的**原点不一样** ——
+    #   · ``p_b`` 是 rig 的世界系，原点在**第一个内角点**；
+    #   · ``getChessboardCorners()``（也就是 mm2tex 拟合用的那套）原点在**板的外角**，
+    #     首个内角点在 (sq, sq)。
+    # 实测：CharucoBoard 30mm 板，getChessboardCorners() 的 x 范围是 [30, 270] mm，
+    # 证实原点在板外角、差一个方格。少了这个平移，渲染出来的板子会整体偏一格。
+    bx = p_b[:, 0] * 1000.0 + spec.square_size * 1000.0
+    by = p_b[:, 1] * 1000.0 + spec.square_size * 1000.0
     mx = mm2tex[0] * bx + mm2tex[2]
     my = mm2tex[1] * by + mm2tex[3]
     # ⚠️ ``remap`` **不支持 INTER_AREA**（只支持 NEAREST/LINEAR/CUBIC/LANCZOS4）。
@@ -233,6 +240,18 @@ def main() -> int:
     #
     # 剩下的嫌疑：标定板姿态与 CharucoBoard **自身坐标系**的对应关系。
     # 上面两个验证都只证明了"自洽"，没证明与 getChessboardCorners() 全局一致。
+    #
+    # 已试但**不是**根因的修正：
+    #   a) remap 的 INTER_AREA -> INTER_LANCZOS4（INTER_AREA 在 remap 里本就是
+    #      未定义行为，该修，但没解决问题）
+    #   b) 补一个方格的坐标系平移（p_b 原点在内角点，getChessboardCorners 原点在
+    #      板外角，实测差一个方格；该修，但没解决问题）
+    #
+    # 下一步建议（**别再走纹理采样这条路**）：
+    #   把 ChArUco 也改成**正向投影 + fillPoly** 渲染 —— 棋盘格黑格照旧，
+    #   marker 用 aruco.generateImageMarker(id, sidePixels=模块数) 拿到模块位图，
+    #   把每个黑色模块的四个角正向投影后 fillPoly。这样彻底绕开纹理分辨率、
+    #   混叠、以及"板坐标 <-> 纹理像素"的坐标系对应问题。
     #
     # **影响范围有限**：target_detect.detect_charuco 在**真实板纹理**上工作正常
     # （35 markers / 54 corners，降采样 3.6x 仍可检出），所以这纯粹是
