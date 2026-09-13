@@ -199,6 +199,117 @@ def detect(gray: np.ndarray, spec: BoardSpec) -> Detection:
     raise ValueError(f"未知标定板类型 {spec.type}")
 
 
+def solve_pnp_board(object_points, image_points, K, dist, prev_R=None,
+                    prev_t=None) -> dict:
+    """解标定板位姿，并**消解平面目标的二义性**。
+
+    为什么必须做这件事
+    ------------------------------------------------------------------
+    平面标定板存在**两解**：两组不同的 (R, t) 给出几乎相同的重投影误差。
+    直接取 ``cv2.solvePnP`` 的返回值，有相当大概率拿到"翻转"的那个解。
+
+    * 对 **C1 内参**无害 —— 翻转解也是合法刚体变换，calibrateCamera 照样收敛，
+      所以 C1 的自检**发现不了**这个问题；
+    * 对 **C2/C3 致命** —— 相机轨迹在两种解之间跳变，相邻帧的相对旋转
+      完全是错的。实测：``SOLVEPNP_IPPE`` 在这种数据上 120/120"成功"，
+      但旋转误差 **179.67°**、位置误差 **2.58 m**，且不报任何错。
+
+    判据
+    ------------------------------------------------------------------
+    板子要被看见，必须同时满足：
+
+    1. 板心在相机前方：``t[2] > 0``；
+    2. 板面**朝向相机**：板法向（世界 +z）在相机系下是 ``R[:,2]``；
+       相机沿 +z 看，所以"朝向相机"意味着 ``R[2,2] < 0``。
+
+    在满足这两条的候选里再选重投影误差小的；若给了上一帧的位姿，
+    误差接近时优先取时间连续的（避免在跳变点选错分支）。
+
+    返回 dict：``rvec``、``tvec``、``n_candidates``、``picked``、``all_err``。
+    """
+    objp = np.asarray(object_points, np.float32)
+    imgp = np.asarray(image_points, np.float32)
+
+    cands = []
+    getter = getattr(cv2, "solvePnPGeneric", None)
+    if getter is not None:
+        try:
+            ok, rvecs, tvecs, errs = getter(
+                objp, imgp, K, dist, flags=cv2.SOLVEPNP_IPPE)
+            if ok and len(rvecs):
+                for rv, tv, e in zip(rvecs, tvecs, errs):
+                    R, _ = cv2.Rodrigues(np.asarray(rv, float))
+                    cands.append((R, np.asarray(tv, float).reshape(3),
+                                  float(np.asarray(e).ravel()[0])))
+        except cv2.error:
+            cands = []
+
+    if not cands:
+        ok, rv, tv = cv2.solvePnP(objp, imgp, K, dist,
+                                  flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok:
+            raise RuntimeError("solvePnP 失败")
+        R, _ = cv2.Rodrigues(rv)
+        cands = [(R, tv.reshape(3), float("nan"))]
+
+    # ── 关键一步：每个候选都要 LM 细化 ─────────────────────────
+    # IPPE 是闭式解，没有非线性细化，精度明显低于迭代法（实测残差能从
+    # 0.6° 涨到 8.9°）。但迭代法又需要好的初值且自己分不出两个分支。
+    # 所以正确组合是：**IPPE 给出两个分支 → 各自 LM 细化 → 再按判据选**。
+    refined = []
+    for R, t, e in cands:
+        rv, _ = cv2.Rodrigues(R)
+        tv = t.reshape(3, 1).copy()
+        rvc = rv.copy()
+        try:
+            if hasattr(cv2, "solvePnPRefineLM"):
+                rvc, tv = cv2.solvePnPRefineLM(objp, imgp, K, dist, rvc, tv)
+            else:
+                _, rvc, tv = cv2.solvePnP(objp, imgp, K, dist, rvc, tv, True,
+                                          flags=cv2.SOLVEPNP_ITERATIVE)
+        except cv2.error:
+            pass
+        R2, _ = cv2.Rodrigues(rvc)
+        proj, _ = cv2.projectPoints(objp, rvc, tv, K, dist)
+        err = float(np.sqrt(np.mean(np.sum(
+            (proj.reshape(-1, 2) - imgp.reshape(-1, 2)) ** 2, axis=1))))
+        refined.append((R2, tv.reshape(3), err))
+    cands = refined
+
+    def ok_front(c):
+        return c[1][2] > 0 and c[0][2, 2] < 0
+
+    front = [c for c in cands if ok_front(c)]
+    pool = front or [c for c in cands if c[1][2] > 0] or cands
+
+    if prev_R is not None and len(pool) > 1:
+        prev_R = np.asarray(prev_R, float)
+        # 重投影误差接近（1.5 倍内）时，取与上一帧最接近的解
+        best_e = min((c[2] for c in pool if np.isfinite(c[2])), default=0.0)
+        near = [c for c in pool if not np.isfinite(c[2]) or c[2] <= best_e * 1.5 + 1e-9]
+        pool = near or pool
+        pool = sorted(pool, key=lambda c: rot_angle(c[0].T @ prev_R))
+    else:
+        pool = sorted(pool, key=lambda c: (c[0][2, 2], c[2]))
+
+    R, t, e = pool[0]
+    rvec, _ = cv2.Rodrigues(R)
+    return {
+        "rvec": rvec.reshape(3, 1),
+        "tvec": t.reshape(3, 1),
+        "n_candidates": len(cands),
+        "n_front_facing": len(front),
+        "picked_err": e,
+        "all_err": [c[2] for c in cands],
+        "ambiguous": len(cands) > 1,
+    }
+
+
+def rot_angle(R: np.ndarray) -> float:
+    """旋转矩阵的旋转角（弧度）。"""
+    return float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+
+
 def draw_detection(gray: np.ndarray, det: Detection, spec: BoardSpec) -> np.ndarray:
     """画检测结果，用于肉眼确认（写报告插图也用它）。"""
     img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if gray.ndim == 2 else gray.copy()
