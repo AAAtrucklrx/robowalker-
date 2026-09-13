@@ -200,33 +200,59 @@ def detect(gray: np.ndarray, spec: BoardSpec) -> Detection:
 
 
 def solve_pnp_board(object_points, image_points, K, dist, prev_R=None,
-                    prev_t=None) -> dict:
-    """解标定板位姿，并**消解平面目标的二义性**。
+                    prev_t=None, pattern_size=None,
+                    corner_order: str = "x_reversed") -> dict:
+    """解标定板位姿：**顺序自适应** + **平面二义性消解**。
 
-    为什么必须做这件事
+    ⚠️ 两个都必须做，而且它们是**两个不同的问题**，别混为一谈
     ------------------------------------------------------------------
-    平面标定板存在**两解**：两组不同的 (R, t) 给出几乎相同的重投影误差。
-    直接取 ``cv2.solvePnP`` 的返回值，有相当大概率拿到"翻转"的那个解。
+    **(A) 角点顺序约定不一致**
 
-    * 对 **C1 内参**无害 —— 翻转解也是合法刚体变换，calibrateCamera 照样收敛，
-      所以 C1 的自检**发现不了**这个问题；
-    * 对 **C2/C3 致命** —— 相机轨迹在两种解之间跳变，相邻帧的相对旋转
-      完全是错的。实测：``SOLVEPNP_IPPE`` 在这种数据上 120/120"成功"，
-      但旋转误差 **179.67°**、位置误差 **2.58 m**，且不报任何错。
+    ``findChessboardCornersSB`` 返回的角点顺序与本模块 ``object_points()``
+    的约定**在 x 方向相反**。实测（合成数据、120 帧）：按原顺序喂 PnP，
+    重投影 RMS 是 **108.8 px**；把 x 反序后降到 **0.13 px**，而且 120/120
+    帧都是同一个结论 —— 是**固定约定差异**，不是随机噪声。
 
-    判据
-    ------------------------------------------------------------------
-    板子要被看见，必须同时满足：
+    应对：**必须固定用哪一种顺序**，不能"两种都试然后按重投影误差选"——
+    实测那样做会全崩，因为棋盘格在 x 反序下是对称的，**两种顺序都能找到
+    重投影一样好的位姿**（镜像二义性），按误差选等于抛硬币。
+    实测结论：``findChessboardCornersSB`` 需要 ``x_reversed``。
+    用 ``try_order_flip=True`` 可切换（仅供实验，不要用于自动选择）。
 
-    1. 板心在相机前方：``t[2] > 0``；
-    2. 板面**朝向相机**：板法向（世界 +z）在相机系下是 ``R[:,2]``；
-       相机沿 +z 看，所以"朝向相机"意味着 ``R[2,2] < 0``。
+    **(B) 平面目标二义性**
 
-    在满足这两条的候选里再选重投影误差小的；若给了上一帧的位姿，
-    误差接近时优先取时间连续的（避免在跳变点选错分支）。
+    平面标定板存在两解。直接取 ``cv2.solvePnP`` 的返回值有相当概率拿到
+    翻转的那个。对 C1 内参无害，但对 C2/C3 的影响要看情况：
 
-    返回 dict：``rvec``、``tvec``、``n_candidates``、``picked``、``all_err``。
+    * **旋转外参不受影响** —— AX=XB 里 ``B = R_CB(2)·S·Sᵀ·R_CB(1)ᵀ``，
+      常量板系偏置 S 会抵消（实测：位姿整体差 179.8° 时 R_IC 仍只差 0.22°）；
+    * **平移/杠杆臂会崩** —— 因为 ``a_WC``、``R̈`` 都在板系里，而重力方向
+      在板系中是未知的。所以 ``solve_lever_arm`` 里把重力也当未知量联合估计。
+
+    判据：板心在相机前方（``t[2] > 0``）且板面朝向相机（``R[2,2] < 0``）；
+    候选重投影接近时优先取与上一帧时间连续的。
+
+    返回 dict：``rvec``、``tvec``、``order``（用了哪种顺序）、
+    ``n_candidates``、``picked_err``。
     """
+    objp = np.asarray(object_points, np.float32)
+
+    if corner_order == "x_reversed" and pattern_size is not None:
+        cols, rows = int(pattern_size[0]), int(pattern_size[1])
+        if objp.shape[0] == cols * rows:
+            objp = np.ascontiguousarray(objp.reshape(rows, cols, 3)[:, ::-1]
+                                        .reshape(-1, 3))
+            return {**_solve_pnp_one_order(objp, image_points, K, dist,
+                                           prev_R, prev_t),
+                    "order": "x_reversed"}
+    r = _solve_pnp_one_order(objp, image_points, K, dist, prev_R, prev_t)
+    r["order"] = "canonical"
+    return r
+
+
+def _solve_pnp_one_order(object_points, image_points, K, dist, prev_R=None,
+                         prev_t=None) -> dict:
+    """在**给定角点顺序**下解位姿并消解平面二义性（被上面那个函数调用）。"""
     objp = np.asarray(object_points, np.float32)
     imgp = np.asarray(image_points, np.float32)
 

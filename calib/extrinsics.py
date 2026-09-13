@@ -422,21 +422,31 @@ def main() -> int:
     else:
         gyro, accel = sess.imu.gyro, sess.imu.accel
 
-    # PnP
+    # PnP（务必用 solve_pnp_board：它同时处理角点顺序约定与平面二义性）
+    from target_detect import solve_pnp_board
+
     R_CB, t_CB, ts = [], [], []
+    prev_R = None
+    n_order_flip = 0
     for p, tt in zip(sess.image_paths, sess.image_ts):
         gray = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
         d = detect(gray, spec)
         if not d.found:
             continue
-        ok, rvec, tvec = cv2.solvePnP(d.object_points, d.image_points,
-                                      intr.K, intr.dist, flags=cv2.SOLVEPNP_IPPE)
-        if not ok:
+        try:
+            sol = solve_pnp_board(d.object_points, d.image_points,
+                                  intr.K, intr.dist, prev_R=prev_R,
+                                  pattern_size=spec.pattern_size)
+        except Exception:  # noqa: BLE001
             continue
-        R_CB.append(cv2.Rodrigues(rvec)[0])
-        t_CB.append(tvec.reshape(3))
+        R = cv2.Rodrigues(sol["rvec"])[0]
+        prev_R = R
+        n_order_flip += int(sol.get("order") == "x_reversed")
+        R_CB.append(R)
+        t_CB.append(sol["tvec"].reshape(3))
         ts.append(tt)
-    print(f"PnP 成功 {len(R_CB)}/{len(sess.image_paths)} 帧")
+    print(f"PnP 成功 {len(R_CB)}/{len(sess.image_paths)} 帧"
+          f"（其中 {n_order_flip} 帧用了 x 反序的角点约定）")
     ts = np.asarray(ts)
 
     # τ

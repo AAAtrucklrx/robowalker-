@@ -249,7 +249,8 @@ def main() -> int:
             continue
         try:
             sol = solve_pnp_board(d.object_points, d.image_points,
-                                  rig.K, rig.dist, prev_R=prev_R)
+                                  rig.K, rig.dist, prev_R=prev_R,
+                                  pattern_size=spec.pattern_size)
         except Exception:  # noqa: BLE001
             continue
         R = cv2.Rodrigues(sol["rvec"])[0]
