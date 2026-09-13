@@ -36,7 +36,7 @@ sys.path.insert(0, str(ROOT / "calib"))
 
 from extrinsics import (T_from_Rt, T_IC_to_dict, ax_xb_residual,  # noqa: E402
                         invert_T, motion_consistency, solve_lever_arm,
-                        solve_rotation)
+                        solve_rotation, solve_rotation_robust)
 from intrinsics import Intrinsics, calibrate_from_paths  # noqa: E402
 from io_data import (build_result, load_config, load_session,  # noqa: E402
                      save_result)
@@ -205,7 +205,7 @@ def run(args) -> int:
     R_WI_all = integrate_gyro(sess.imu.t, gyro)
     idx = [int(np.argmin(np.abs(sess.imu.t - (t - tau)))) for t in ts]
     R_WI = R_WI_all[idx]
-    rot_res = solve_rotation(R_WI, R_CB, verbose=True)
+    rot_res = solve_rotation_robust(R_WI, R_CB, verbose=True)
     R_IC = rot_res["R_IC"]
 
     mc = motion_consistency(R_WI, R_CB, R_IC)
@@ -293,6 +293,9 @@ def run(args) -> int:
         "用绝对姿态比会凭空多出几十度误差。",
         "平移外参由**加速度计杠杆臂效应**估计；重力向量与杠杆臂联合最小二乘，"
         "`|g|` 应等于 9.80665，是内建自检。",
+        f"鲁棒估计：手眼旋转用了帧级异常剔除（{rot_res.get('n_total')} → "
+        f"{rot_res.get('n_used')} 帧）；杠杆臂用了 Huber 加权 IRLS"
+        f"（降权 {lev.get('n_downweighted', 0)}/{lev.get('n_samples')} 个样本）。",
     ]
     if "error" in xval:
         notes.append(f"交叉验证未完成：{xval['error']}")
@@ -307,6 +310,9 @@ def run(args) -> int:
          "motion_consistency": mc,
          "handeye_spread_deg": rot_res["max_spread_deg"],
          "handeye_cluster": rot_res.get("cluster"),
+         "robust_trim": {"n_total": rot_res.get("n_total"),
+                         "n_used": rot_res.get("n_used"),
+                         "history": rot_res.get("trim_history")},
          "ax_xb_residual_deg_max": float(ax_xb_residual(R_WI, R_CB, R_IC).max()),
          "cross_validation": {k: v for k, v in xval.items() if k != "per_fold_R"},
          "bootstrap": {k: v for k, v in boot.items() if k != "rot_samples"},

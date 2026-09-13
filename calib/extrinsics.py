@@ -222,12 +222,92 @@ def _savgol(y, dt, window, polyorder, deriv=0, axis=0):
     return savgol_filter(y, w, polyorder, deriv=deriv, delta=dt, axis=axis)
 
 
+def solve_rotation_robust(R_WI_list, R_CB_list, methods=None, verbose: bool = False,
+                          trim: float = 0.2, iters: int = 3) -> dict:
+    """带**帧级异常剔除**的手眼旋转标定。
+
+    为什么需要：真机数据里总有几帧是坏的 —— 运动模糊、标定板部分出画、
+    PnP 在两个解之间跳、或者手抖那一瞬间。普通最小二乘会被它们带偏，
+    而**残差看起来仍然正常**。
+
+    做法（trimmed re-solve，简单但有效）：
+
+    1. 全量解一次 ``R_IC``；
+    2. 用解出的 ``R_IC`` 算每帧的 AX=XB 相对旋转残差，
+       取该帧参与的所有相邻对里的**最大值**作为这一帧的"坏度"；
+    3. 剔掉坏度最大的 ``trim`` 比例；
+    4. 回到 1，迭代 ``iters`` 次。
+
+    返回除 ``solve_rotation`` 的字段外，还带 ``kept_indices`` / ``n_used`` /
+    ``trim_history``（剔了多少、阈值多少，可直接写进报告）。
+    """
+    n_total = len(R_WI_list)
+    idx = np.arange(n_total)
+    hist = []
+    for it in range(max(1, iters)):
+        sub_WI = [R_WI_list[i] for i in idx]
+        sub_CB = [R_CB_list[i] for i in idx]
+        res = solve_rotation(sub_WI, sub_CB, methods=methods,
+                             verbose=bool(verbose and it == 0))
+        R_IC = res["R_IC"]
+        # 帧太少就不再剔，否则估不准
+        if it == iters - 1 or len(idx) < 60:
+            break
+        pair = np.asarray(ax_xb_residual(sub_WI, sub_CB, R_IC))
+        if len(pair) == 0:
+            break
+        bad = np.zeros(len(idx))
+        bad[:-1] = np.maximum(bad[:-1], pair)
+        bad[1:] = np.maximum(bad[1:], pair)
+        thr = float(np.percentile(bad, 100.0 * (1.0 - trim)))
+        keep = bad <= thr
+        if keep.sum() < max(40, int(0.5 * len(idx))):
+            break
+        hist.append({"iter": it, "n_before": int(len(idx)),
+                     "n_after": int(keep.sum()), "thr_deg": thr})
+        idx = idx[keep]
+
+    res["kept_indices"] = idx.tolist()
+    res["n_used"] = int(len(idx))
+    res["n_total"] = n_total
+    res["trim_history"] = hist
+    if verbose and hist:
+        print(f"  鲁棒剔除：{n_total} → {res['n_used']} 帧"
+              f"（{len(hist)} 轮，末轮阈值 {hist[-1]['thr_deg']:.4f}°）")
+    return res
+
+
+# ══════════════════════════════════════════════════════════════
+#  ② 平移（杠杆臂）
+# ══════════════════════════════════════════════════════════════
+def _irls_huber(A, b, n_iter: int = 8, k: float = 1.345):
+    """Huber 加权的迭代重加权最小二乘（IRLS）。
+
+    标定数据里少数几帧的残差可能是其余的几十倍（坏帧）。普通最小二乘是
+    平方损失，会被它们主导；Huber 损失对小残差保持平方、对大残差转线性，
+    等价于自动把大残差样本降权。
+
+    ``k=1.345`` 是 Huber 的标准取法（正态下约 95% 效率）。
+    尺度用 MAD 稳健估计，避免被离群值本身污染。
+    """
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    w = np.ones(len(b))
+    for _ in range(max(1, n_iter)):
+        res = b - A @ sol
+        s = 1.4826 * float(np.median(np.abs(res - np.median(res)))) + 1e-12
+        u = np.abs(res) / s
+        w = np.where(u <= k, 1.0, k / np.maximum(u, 1e-12))
+        sw = np.sqrt(w)
+        sol, *_ = np.linalg.lstsq(A * sw[:, None], b * sw, rcond=None)
+    return sol, w
+
+
 def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
                     R_IC, tau: float = 0.0, gravity: float = 9.80665,
                     pos_sigma: float | None = None, rot_sigma: float = 0.002,
                     smooth_window: int = 9, polyorder: int = 3,
                     use_spline: bool = True, estimate_gravity: bool = True,
-                    verbose: bool = False) -> dict:
+                    robust: bool = True, verbose: bool = False) -> dict:
     """用杠杆臂效应解 IMU 原点在相机系下的坐标 ``r``。
 
     ``use_spline=True``（默认）用 **B样条解析导数**求 ``a_WC`` 与 ``R̈``；
@@ -329,14 +409,16 @@ def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
     # 这就成了一个**内建的自检指标**。
     if estimate_gravity:
         A = np.hstack([M, np.tile(np.eye(3), (n, 1))])
-        sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+        sol, w_final = _irls_huber(A, rhs, n_iter=8 if robust else 1)
         r, g_est = sol[:3], sol[3:]
         resid = A @ sol - rhs
     else:
         g_est = np.array([0.0, 0.0, -gravity])
         y = rhs - np.tile(g_est, n)
-        r, *_ = np.linalg.lstsq(M, y, rcond=None)
+        sol, w_final = _irls_huber(M, y, n_iter=8 if robust else 1)
+        r = sol[:3]
         resid = M @ r - y
+    n_downweighted = int(np.sum(w_final < 0.9))
 
     cond = float(np.linalg.cond(M))
     rms = float(np.sqrt(np.mean(resid ** 2)))
@@ -355,6 +437,7 @@ def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
             -g_est[2] / max(g_norm, 1e-9), -1, 1)))),
         "residual_rms_ms2": rms,
         "cond": cond,
+        "n_downweighted": n_downweighted,
         "n_samples": int(len(t)),
         "pos_sigma_used": float(pos_sigma),
         "method": ("spline" if use_spline else "savgol")
@@ -373,6 +456,9 @@ def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
               f"(|t|={np.linalg.norm(t_IC)*100:.2f} cm)")
         print(f"  LS 残差 RMS = {rms:.5f} m/s²（杠杆臂信号量级约 0.06 m/s²），"
               f"cond(M) = {cond:.1f}")
+        if n_downweighted:
+            print(f"  Huber 降权样本 {n_downweighted}/{n} 个"
+                  f"（{n_downweighted/n*100:.1f}%，坏帧会被自动压制）")
         if g_err > 0.2:
             print(f"  ⚠️ |g| 偏差 {g_err:.4f} 偏大：说明板系与世界系未对齐或数据有问题")
         print(f"  {'✅ 可信' if out['reliable'] else '⚠️ 残差偏大，平移仍不可信'}")
