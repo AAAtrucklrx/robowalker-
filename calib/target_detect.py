@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""标定板检测：从图像里找出特征点的亚像素位置。
+
+任务书允许棋盘格 / ArUco / AprilTag / 任何已知几何的目标。本模块实现两类：
+
+* **棋盘格 (chessboard)** —— 默认。内角点检测 + 亚像素细化。
+* **ChArUco** —— 方格 + ArUco。**部分出画或局部遮挡时仍能检测**，
+  对采集动作的容错高得多，强烈建议有条件时改用它。
+
+一个关键区别（也是新手最容易搞错的）
+------------------------------------------------------------------
+``pattern_size`` 是**内角点数**，不是方格数：
+
+    棋盘格 10x7 个方格  ->  pattern_size = (9, 6)
+
+``square_size`` 必须与**打印实物**一致，单位米。它写错不会让内参错，
+但会让平移外参的尺度整体错（任务书 5.3 专门点了这一条）。
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+
+@dataclass
+class BoardSpec:
+    """标定板的几何定义。所有参数都来自配置文件，不硬编码。"""
+
+    type: str = "chessboard"            # chessboard | charuco
+    pattern_size: tuple[int, int] = (9, 6)   # 内角点 (列, 行)
+    square_size: float = 0.025          # 米
+    marker_size: float = 0.0            # charuco: marker 边长（米）
+    dict_name: str = "DICT_5X5_100"     # charuco 字典
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "BoardSpec":
+        t = cfg.get("target", {})
+        typ = t.get("type", "chessboard")
+        if typ == "chessboard":
+            c = t.get("chessboard", {})
+            return cls("chessboard", tuple(c.get("pattern_size", (9, 6))),
+                       float(c.get("square_size", 0.025)))
+        if typ in ("aruco", "charuco"):
+            a = t.get("aruco", {})
+            ps = tuple(a.get("pattern_size", (5, 7)))
+            sq = float(a.get("square_size", a.get("marker_size", 0.05)))
+            return cls("charuco", ps, sq,
+                       float(a.get("marker_size", sq * 0.75)),
+                       a.get("dict", "DICT_5X5_100"))
+        raise ValueError(f"暂不支持的标定板类型: {typ}")
+
+    # -- 几何 --------------------------------------------------
+    def object_points(self) -> np.ndarray:
+        """板坐标系下的 3D 特征点，z=0 平面，原点在左上角第一个内角点。
+
+        约定：x 向右、y 向下、z 垂直板面向外。返回值 shape=(N,3) float32。
+        """
+        cols, rows = self.pattern_size
+        s = self.square_size
+        # 注意 y 向下，与图像坐标系一致（OpenCV 的 findChessboardCorners
+        # 也是从左上角开始按行返回角点）
+        pts = np.zeros((cols * rows, 3), np.float32)
+        pts[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2) * s
+        return pts
+
+    def expected_corners(self) -> int:
+        return self.pattern_size[0] * self.pattern_size[1]
+
+    def __str__(self):
+        c, r = self.pattern_size
+        return (f"{self.type} 内角点 {c}x{r}，方格 {self.square_size*1000:.2f} mm"
+                f"（板面 {(c+1)*self.square_size*1000:.0f}x"
+                f"{(r+1)*self.square_size*1000:.0f} mm）")
+
+
+@dataclass
+class Detection:
+    """一张图的检测结果。"""
+
+    found: bool
+    image_points: np.ndarray | None = None      # (N,1,2) float32
+    object_points: np.ndarray | None = None     # (N,3) float32
+    method: str = ""
+    marker_ids: np.ndarray | None = None        # charuco 才有
+
+
+# ══════════════════════════════════════════════════════════════
+#  棋盘格
+# ══════════════════════════════════════════════════════════════
+def _sb_flags():
+    """findChessboardCornersSB 只接受 EXHAUSTIVE/ACCURACY/LARGER/MARKER，
+    传经典检测器的 flag（ADAPTIVE_THRESH 等）会直接抛异常。"""
+    f = 0
+    for name in ("CALIB_CB_EXHAUSTIVE", "CALIB_CB_ACCURACY"):
+        f |= getattr(cv2, name, 0)
+    return f
+
+
+def _classic_flags():
+    f = 0
+    for name in ("CALIB_CB_ADAPTIVE_THRESH", "CALIB_CB_NORMALIZE_IMAGE"):
+        f |= getattr(cv2, name, 0)
+    return f
+
+
+def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
+                      refine: bool = True) -> Detection:
+    """检测棋盘格内角点。
+
+    优先用 ``findChessboardCornersSB``（OpenCV 4.x 的 sector-based 检测器，
+    自带亚像素精度、对噪声和模糊鲁棒得多）；不可用时退回
+    ``findChessboardCorners`` + ``cornerSubPix``。
+    """
+    ps = tuple(int(v) for v in spec.pattern_size)
+    op = spec.object_points()
+
+    if hasattr(cv2, "findChessboardCornersSB"):
+        ok, corners = cv2.findChessboardCornersSB(gray, ps, flags=_sb_flags())
+        if ok:
+            c = np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2)
+            # SB 检测器对某些图像会多返回一组首尾重复点，剔掉
+            if len(c) > len(op):
+                c = c[: len(op)]
+            return Detection(True, c, op, method="SB")
+
+    ok, corners = cv2.findChessboardCorners(gray, ps, flags=_classic_flags())
+    if not ok:
+        return Detection(False, None, None, method="classic")
+    if refine:
+        # 亚像素细化：粗检测的角点误差能差一个量级，这一步不能省
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
+        corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+    return Detection(True, corners.astype(np.float32), op, method="classic+subpix")
+
+
+# ══════════════════════════════════════════════════════════════
+#  ChArUco（兼容 OpenCV 4.6 与 4.7+ 两套 API）
+# ══════════════════════════════════════════════════════════════
+def _aruco_dict(name: str):
+    a = cv2.aruco
+    if not hasattr(a, name):
+        raise ValueError(f"OpenCV 没有字典 {name}")
+    getter = getattr(a, "getPredefinedDictionary", None)
+    return getter(getattr(a, name)) if getter else a.Dictionary_get(getattr(a, name))
+
+
+def make_charuco_board(spec: BoardSpec):
+    a, cv = cv2.aruco, cv2
+    d = _aruco_dict(spec.dict_name)
+    ms = spec.marker_size or spec.square_size * 0.75
+    if hasattr(a, "CharucoBoard"):
+        return a.CharucoBoard(spec.pattern_size, spec.square_size, ms, d)
+    return a.CharucoBoard_create(spec.pattern_size[0], spec.pattern_size[1],
+                                 spec.square_size, ms, d)
+
+
+def detect_charuco(gray: np.ndarray, spec: BoardSpec) -> Detection:
+    a = cv2.aruco
+    board = make_charuco_board(spec)
+    d = _aruco_dict(spec.dict_name)
+    params = a.DetectorParameters() if hasattr(a, "DetectorParameters") \
+        else a.DetectorParameters_create()
+
+    if hasattr(a, "CharucoDetector"):
+        det = a.CharucoDetector(board)
+        ch_corners, ch_ids, mk_corners, mk_ids = det.detectBoard(gray)
+    else:
+        mk_corners, mk_ids, _ = a.detectMarkers(gray, d, parameters=params)
+        if mk_ids is None or len(mk_ids) < 4:
+            return Detection(False, method="charuco")
+        _, ch_corners, ch_ids = a.interpolateCornersCharuco(
+            mk_corners, mk_ids, gray, board)
+
+    if ch_ids is None or len(ch_ids) < 6:
+        return Detection(False, method="charuco")
+
+    ch_ids = np.asarray(ch_ids).reshape(-1)
+    ch_corners = np.asarray(ch_corners, dtype=np.float32).reshape(-1, 1, 2)
+    # ChArUco 只检测到部分角点是常态：只取检到的那些 3D 点
+    all_obj = board.getChessboardCorners().astype(np.float32) \
+        if hasattr(board, "getChessboardCorners") else board.chessboardCorners
+    obj = all_obj[ch_ids]
+    return Detection(True, ch_corners, obj, method="charuco",
+                     marker_ids=np.asarray(mk_ids).reshape(-1))
+
+
+# ══════════════════════════════════════════════════════════════
+#  统一入口
+# ══════════════════════════════════════════════════════════════
+def detect(gray: np.ndarray, spec: BoardSpec) -> Detection:
+    if gray.ndim == 3:
+        gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    if spec.type == "chessboard":
+        return detect_chessboard(gray, spec)
+    if spec.type == "charuco":
+        return detect_charuco(gray, spec)
+    raise ValueError(f"未知标定板类型 {spec.type}")
+
+
+def draw_detection(gray: np.ndarray, det: Detection, spec: BoardSpec) -> np.ndarray:
+    """画检测结果，用于肉眼确认（写报告插图也用它）。"""
+    img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if gray.ndim == 2 else gray.copy()
+    if det.found and det.image_points is not None:
+        cv2.drawChessboardCorners(img, tuple(int(v) for v in spec.pattern_size),
+                                  det.image_points, det.found)
+    return img
+
+
+def main() -> int:
+    """CLI：对单张图/一个目录做检测，打印结果并可选导出可视化。"""
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser(description="标定板检测自检")
+    ap.add_argument("inputs", nargs="+", help="图像文件或目录")
+    ap.add_argument("--pattern", default="9x6", help="内角点数，如 9x6")
+    ap.add_argument("--square-mm", type=float, default=25.0)
+    ap.add_argument("--type", default="chessboard", choices=["chessboard", "charuco"])
+    ap.add_argument("--dict", default="DICT_5X5_100")
+    ap.add_argument("--marker-mm", type=float, default=0.0)
+    ap.add_argument("--save-dir", default=None, help="把可视化结果存到这里")
+    args = ap.parse_args()
+
+    c, r = (int(v) for v in args.pattern.lower().split("x"))
+    spec = BoardSpec(args.type, (c, r), args.square_mm / 1000.0,
+                     args.marker_mm / 1000.0, args.dict)
+    print(f"标定板: {spec}")
+    print(f"3D 点数: {len(spec.object_points())}")
+
+    files: list[Path] = []
+    for s in args.inputs:
+        p = Path(s)
+        files += sorted(p.glob("*.png")) + sorted(p.glob("*.jpg")) if p.is_dir() else [p]
+
+    outdir = Path(args.save_dir) if args.save_dir else None
+    if outdir:
+        outdir.mkdir(parents=True, exist_ok=True)
+    n_ok = 0
+    for f in files:
+        gray = cv2.imread(str(f), cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            print(f"  ❌ 读不了 {f}")
+            continue
+        det = detect(gray, spec)
+        if det.found:
+            n_ok += 1
+            pts = det.image_points.reshape(-1, 2)
+            print(f"  ✅ {f.name:24s} {len(pts):3d} 点 方法={det.method:17s} "
+                  f"x∈[{pts[:,0].min():6.1f},{pts[:,0].max():6.1f}] "
+                  f"y∈[{pts[:,1].min():6.1f},{pts[:,1].max():6.1f}]")
+            if outdir:
+                cv2.imwrite(str(outdir / f"{f.stem}_det.png"),
+                            draw_detection(gray, det, spec))
+        else:
+            print(f"  ❌ {f.name:24s} 未检出（方法={det.method}）")
+    print(f"\n检出 {n_ok}/{len(files)}")
+    return 0 if n_ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

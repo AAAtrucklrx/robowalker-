@@ -236,24 +236,27 @@ calib_ws/
 ├── config/
 │   └── calibration.yaml        ← 所有可调参数（不硬编码在代码里）
 ├── calib/                      ← 标定源码
-│   ├── imu_h7.py               ✅ H7 IMU 二进制协议解析（实测验证，见 doc/H7_IMU协议.md）
-│   ├── io_data.py              数据读取（图像/时间戳/IMU）
-│   ├── target_detect.py        标定板检测（棋盘格/ArUco/AprilTag）
-│   ├── intrinsics.py           相机内参标定
-│   ├── imu.py                  IMU 预处理、零偏、姿态积分
-│   ├── sync.py                 相机-IMU 时间对齐
-│   ├── extrinsics.py           Camera-IMU 外参（手眼标定 AX=XB）
-│   ├── validate.py             误差与一致性验证
-│   └── run_calibration.py      主入口
+│   ├── imu_h7.py               ✅ H7 IMU 二进制协议解析（实测验证）
+│   ├── camera.py               ✅ 统一相机层：U3V(aravis) + UVC(OpenCV)，双时间戳
+│   ├── io_data.py              ✅ 数据集与结果读写（YAML/JSON 可回读）
+│   ├── target_detect.py        ✅ 标定板检测（棋盘格 SB 检测器 / ChArUco）
+│   ├── intrinsics.py           ✅ C1 相机内参标定 + train/val 分离验证
+│   ├── sync.py                 ⏳ C2 相机-IMU 时间对齐
+│   ├── extrinsics.py           ⏳ C3 Camera-IMU 外参（手眼标定 AX=XB）
+│   ├── validate.py             ⏳ C4 误差与一致性验证
+│   └── run_calibration.py      ⏳ 主入口
 ├── tools/
+│   ├── make_board.py           ✅ 生成尺寸精确的可打印标定板（PDF，带校验尺）
+│   ├── selftest_intrinsics.py  ✅ C1 两层合成自检（不需要实物标定板）
+│   ├── capture_h7.py           ✅ 数据采集（相机 + H7 IMU，含无窗口自测）
 │   ├── probe_hardware.py       硬件与权限自检
-│   ├── capture_h7.py           ✅ 数据采集（UVC 相机 + H7 IMU，当前硬件用这个）
-│   ├── capture_dataset.py      数据采集（旧版，只支持文本协议 IMU，保留参考）
+│   ├── capture_dataset.py      旧版采集（只支持文本协议 IMU，保留参考）
 │   ├── check_motion.py         运动激励体检
 │   └── setup_permissions.sh    udev/用户组授权（需 sudo）
+├── boards/                     生成的标定板 PDF/PNG（打印用）
 ├── doc/
 │   ├── H7_IMU协议.md           ✅ 协议逆向结论与证据链
-│   ├── 相机取流诊断.md          海康 U3V 取流诊断
+│   ├── 相机取流诊断.md          ✅ 海康 U3V 取流诊断（结论：是 USB 口的问题）
 │   ├── IMU板排错清单.md
 │   └── ROS2上手说明.md
 ├── data/                       采集数据（示例数据另附）
@@ -265,12 +268,28 @@ calib_ws/
 | 步骤 | 状态 |
 |---|---|
 | 环境搭建（Python 依赖、虚拟环境） | ✅ 完成 |
-| 相机接入与画面验证 | ✅ 笔记本 UVC 相机可用（`/dev/video0` 640×480@30fps）；海康 U3V 工业相机**尚未取流成功**，见 doc/相机取流诊断.md |
-| 串口 IMU 接入与协议解析 | ✅ 完成（H7 板 82 字节帧 @1 kHz 全部字段已解出并验证，见 doc/H7_IMU协议.md） |
+| **海康 U3V 工业相机取流** | ✅ **已打通**（换 USB3 口后；aravis Python 绑定，1624×1240 Mono8 @10Hz，零丢包，**硬件时间戳可用**） |
+| 笔记本 UVC 相机 | ✅ 可用（`/dev/video0` 640×480@30fps），算法开发阶段的默认数据源 |
+| 串口 IMU 接入与协议解析 | ✅ 完成（H7 板 82 字节帧 @1 kHz 全部字段已解出并验证） |
+| 统一相机抽象层 `calib/camera.py` | ✅ 完成（U3V + UVC，同一接口，带双时间戳） |
+| 可打印标定板生成 `tools/make_board.py` | ✅ 完成（PDF 页面尺寸精确到 0.01 mm，附 100 mm 校验尺） |
 | 数据采集工具 | ✅ 完成（`tools/capture_h7.py`，含无窗口自测） |
 | 运动激励体检工具 | ✅ 完成 |
-| 标定算法（`calib/`） | ⏳ 待实现（目录目前只有 `imu_h7.py`） |
-| 验证与报告 | ⏳ 待实现 |
+| **C1 相机内参** | ✅ **代码完成并通过两层合成自检**（`target_detect.py` + `intrinsics.py` + `tools/selftest_intrinsics.py`） |
+| C2 时间对齐 | ⏳ 待实现（`calib/sync.py`） |
+| C3 Camera-IMU 外参 | ⏳ 待实现（`calib/extrinsics.py`） |
+| C4 验证与报告 | ⏳ 待实现（`calib/validate.py`、`run_calibration.py`） |
+
+### C1 自检结果（可复现）
+
+```bash
+.venv/bin/python tools/selftest_intrinsics.py
+```
+
+| 层级 | 内容 | 结果 |
+|---|---|---|
+| Level 1 · 点级 | 正向投影角点 → 直接标定，**不经过图像**，检验标定数学 | ✅ fx/fy/cx/cy 误差 < 0.001 px；畸变函数相对误差 0.000% |
+| Level 2 · 图像级 | 渲染棋盘格 → 检测 → 标定，端到端 | ✅ 40/40 检出；残差 0.082 px（渲染器边缘模型地板） |
 
 ## 11. 已知限制
 
@@ -278,14 +297,16 @@ calib_ws/
   是因为 udev 兜底规则给了 `ttyACM*` 0666；但 **`/dev/rw_imu` 这个稳定别名还不存在**
   （规则里没有新板的 PID）。要修好请执行一次：
   `sudo bash ~/calib_ws/tools/setup_permissions.sh`（脚本已更新，含 `0483:6666`）。
-- 当前无 `v4l-utils`，摄像头参数查看依赖 OpenCV 而非 `v4l2-ctl`。
-- 相机的曝光时间若为自动模式，帧率会有抖动，高动态运动下时间对齐误差变大；
-  正式采集请加 `--lock-exposure`（已加入采集脚本），并在结果里核对实际帧率。
+- **U3V 相机对 USB 口非常敏感**：换口前 aravis 报 `USB3Vision write_memory timeout`，
+  换到机身原生 USB3 口后立刻正常。**遇到"时好时坏"先怀疑线/口，不要先怀疑库。**
+- aravis 的 Python 绑定需要额外的 29.7 kB 包：`sudo apt install gir1.2-aravis-0.8`。
+  没装时 `calib/camera.py` 会直接打印这条命令。临时方案见该文件 docstring。
+- 相机曝光/增益**必须手动锁定**（`calib/camera.py` 已默认关掉自动模式）；
+  自动曝光会让帧率抖动，时间对齐误差变大。
+- 当前无 `v4l-utils`，UVC 参数查看依赖 OpenCV 而非 `v4l2-ctl`。
 - **IMU 磁力计恒为 0**（未启用）→ yaw 不可观测，姿态只能靠陀螺积分，会缓慢漂移。
   写外参标定程序时不要依赖磁力计通道。
-- 海康 U3V 相机在 aravis 下的**取流仍不稳定**：枚举与 GenICam 寄存器读写时好时坏，
-  取流阶段报 `USB3Vision write_memory timeout`。已定性为 USB 链路/协议交互问题
-  （非权限），建议优先试换 USB3 口与线缆，并走海康 MVS SDK 路线。
+- 标定精度**主要取决于采集动作**，不是算法。见第 4 节的采集要求。
 
 ---
 
@@ -293,7 +314,7 @@ calib_ws/
 
 | 设备 | 型号 / 标识 | 连接方式 | 状态 |
 |---|---|---|---|
-| 工业相机 | 海康机器人 **MV-CS020-10UC** (SN `DA3489519`) | USB 3.2 Gen1，5 Gbps，800 mA | 枚举正常，**取流未打通**（aravis 报 USB 超时） |
+| 工业相机 | 海康机器人 **MV-CS020-10UC** (SN `DA3489519`) | USB 3.2 Gen1，5 Gbps，800 mA | ✅ **取流已打通**（换 USB3 口后；1624×1240 Mono8 @10Hz 零丢包，`DeviceTimestamp` 可用） |
 | IMU 板（在用） | **H7_IMU_With_EKF** (SN `375939523233`, VID:PID `0483:6666`) | USB-C → CDC 虚拟串口 `/dev/ttyACM0` | ✅ **完全正常**：82 字节帧 @1 kHz，六轴+欧拉角+四元数，1 秒零丢帧 |
 | IMU 板（已退役） | STM32 Virtual ComPort (SN `3144366B3233`, VID:PID `0483:5740`) | CDC `/dev/ttyACM0` | ❌ 数据区恒为 0，已换成上面那块 |
 | 笔记本摄像头 | ASUS FHD webcam / IR camera | UVC `/dev/video0-3` | ✅ 可用，算法开发阶段用它 |
@@ -303,44 +324,49 @@ calib_ws/
 > 下文 12.1 节保留的是旧板的故障诊断记录，**仅作考古，不要照着它判断当前状态**。
 > 当前板的协议见 [doc/H7_IMU协议.md](doc/H7_IMU协议.md)。
 
-### 相机取流路线（不兼容 UVC，不能用 `--camera` 参数）
+### 相机取流：已打通（2026-09-13）
 
 `lsusb -v` 显示该相机三个接口全是 `bInterfaceClass=239 / bInterfaceSubClass=5 (USB3 Vision)`，
-**没有 UVC Video 类接口**，所以 `/dev/video*` 与 OpenCV 均无法打开它。可选方案：
+**没有 UVC Video 类接口**，所以 `/dev/video*` 与 OpenCV **永远打不开它**——这是协议不同，
+不是配置问题。实际可用的路线：
 
-| 方案 | 依赖 | 优点 | 缺点 |
-|---|---|---|---|
-| A. aravis | ✅ **已装**（`aravis-tools` / `libaravis-0.8-0` 0.8.30，科大源） | 开源、免注册 | 对本相机**取流不稳定**，见下 |
-| B. 海康 MVS SDK（**当前首选**） | 官网下载 `MVS-x.x.x_x86_64_xxxxxx.tar.gz`（需注册账号） | 官方支持、有硬件时间戳、参数最全 | 注册下载、体积大、闭源 |
-| C. harvesters + GenTL | 已装 `harvesters 1.4.3` + `genicam 1.6.0`，但**缺 .cti producer** | Python 接口现成 | producer 必须来自 A 或 B |
+| 方案 | 状态 | 说明 |
+|---|---|---|
+| **A. aravis + Python 绑定** | ✅ **当前使用** | `aravis-tools` + `libaravis-0.8-0` 已有；再装 29.7 kB 的 `gir1.2-aravis-0.8` 即得 Python 接口 |
+| B. 海康 MVS SDK | 未使用 | 官方路线，需注册下载；优势是参数最全。目前没必要 |
+| C. harvesters + GenTL | 不可用 | 需要 .cti producer，aravis 不提供 |
 
-**aravis 现状（2026-09-13 复测，比 9/10 有进展）**：设备能被枚举，GenICam 属性
-（`SensorSize` / `Gain` / `ExposureTime`）也能读出来，但**取流阶段失败**：
-
-```
-Found 1 device
-Testing 'U3V:MV-CS020-10UC'
-Properties:SensorSizeReadout        SUCCESS
-Properties:ExposureTimeReadout      SUCCESS
-MultipleAcquisitionA:BufferCheck    FAILURE 0/10 [AcquisitionStop] USB3Vision write_memory timeout
-```
-
-且**行为不稳定**：同一分钟内重跑，会退回到 `Failed to connect`。
-寄存器读写时好时坏 + 取流超时，典型指向 **USB3 链路质量问题（线缆/供电/主控口）**，
-而不是纯软件不兼容。
-
-**建议的排查顺序**（成本从低到高）：
-
-1. **换线**：用相机原装 USB3 线，或明确标注 5 Gbps 的短线；很多"随机超时"就是线。
-2. **换口**：直接插机身上的 USB3 口，不要经过扩展坞/Hub。
-3. 确认链路速率：`lsusb -t` 里该设备应显示 `5000M`（当前是，若变 480M 就是线/口退化）。
-4. 以上都排完仍失败，再上 **MVS SDK**（官方路线，且带硬件时间戳，
-   对 Camera-IMU 标定的时间对齐有实质收益）。
+**关键结论：之前失败不是软件不兼容，是 USB 口的问题。**
+换到机身原生 USB3 口后，`arv-test-0.8` 的 `SingleAcquisition` /
+`SoftwareTrigger` / `MultipleAcquisitionB` 全部 SUCCESS，本项目的
+`calib/camera.py` 实测 **零丢包、帧间隔精确 10.00 ms**。
 
 ```bash
-lsusb -t | grep -B1 -A3 2bdf      # 看链路速率是否为 5000M
-timeout 30 arv-test-0.8           # 看 GenICam 属性与取流各自成败
+sudo apt install -y gir1.2-aravis-0.8        # 29.7 kB，装完即可用 Python 取流
+
+# 自检与取图
+python3 calib/camera.py --list                       # 列出设备
+python3 calib/camera.py --source hik --info          # 打印能力与参数范围
+python3 calib/camera.py --source hik --grab 5 --out /tmp/hik \
+    --width 1624 --height 1240 --pixel-format Mono8 --exposure 20000 --gain 12
+
+# 若还要用 aravis 自身工具
+lsusb -t | grep -B1 -A3 2bdf      # 链路速率必须是 5000M；变成 480M 就是线/口退化
+timeout 30 arv-test-0.8           # 各功能项自检
 ```
+
+**这块相机最值钱的特性：支持 `DeviceTimestamp`**（1 GHz tick，实测帧间隔
+精确 10.00 ms）。它不随主机负载抖动，比主机接收时刻干净得多，对 C2 时间对齐
+是实质收益。`calib/camera.py` 会把设备时间戳与主机单调时钟一起给出来。
+
+**像素格式选 Mono8。** 相机是彩色的，但实测 `Mono8` 由**相机内部**完成灰度
+转换（对角差 1.26 vs 轴向差 1.07；若是把原始 Bayer 拼图直接丢出来会出现
+2~3 倍的高频棋盘格伪影，会严重伤害亚像素角点检测）。用 `BayerRG8` 也可以，
+但需要自己 `cv2.cvtColor(..., COLOR_BayerRG2GRAY)`。
+
+**⚠️ 遇到"时好时坏"先怀疑线/口。** 本次就是换了一个 USB 口就全好了。
+寄存器读写时好时坏 + 取流超时，典型指向 USB3 链路质量（线缆/供电/主控口），
+不要在软件层死磕。
 
 ### 权限
 
