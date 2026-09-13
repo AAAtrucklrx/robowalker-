@@ -74,8 +74,14 @@ def render_view_from_texture(tex, mm2tex, spec, K, dist, rvec, tvec, image_size,
     by = p_b[:, 1] * 1000.0
     mx = mm2tex[0] * bx + mm2tex[2]
     my = mm2tex[1] * by + mm2tex[3]
+    # ⚠️ ``remap`` **不支持 INTER_AREA**（只支持 NEAREST/LINEAR/CUBIC/LANCZOS4）。
+    # 之前这里写了 INTER_AREA，结果是未定义行为 —— 实测渲染出来的板子
+    # **marker 全部检不出**（原图 0 个，左右/上下翻转反而各能检出 35 个，
+    # 一度让我误判成"渲染器把手性搞反了"）。
+    # 改成 INTER_LINEAR；降采样比很大时用 LANCZOS4 更抗混叠。
+    interp = cv2.INTER_LANCZOS4 if hasattr(cv2, "INTER_LANCZOS4") else cv2.INTER_LINEAR
     img = cv2.remap(tex, mx.reshape(Hs, Ws).astype(np.float32),
-                    my.reshape(Hs, Ws).astype(np.float32), cv2.INTER_AREA,
+                    my.reshape(Hs, Ws).astype(np.float32), interp,
                     borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
     img[~valid.reshape(Hs, Ws)] = bg
     if ss > 1:
@@ -214,7 +220,23 @@ def main() -> int:
     print("           平面 PnP 两解可都不是真解（实测差 179.8°），图像上无法区分。")
     print("   ChArUco：角点带唯一 ID → 对应关系物理唯一确定，上述两个问题**不存在**。")
 
-    # ⚠️ 已知问题（2026-09-13）：**本脚本的合成渲染器有手性 bug**。
+    # ⚠️ 已知问题（2026-09-13，**未定位完**）：本脚本的合成渲染器渲染出的板子
+    # 检测不到 marker（原图 0 个，左右/上下翻转反而各 35 个）。
+    #
+    # 但已经用实测**排除**了三环，所以别再从这些方向查：
+    #   1) 逆映射数学：正投影 -> 逆映射往返误差 0.00005 mm  ✅
+    #   2) 纹理渲染器整体：与已知正确的 fillPoly 渲染器 RMS=0.63，
+    #      而所有镜像都是 7.61  ✅
+    #   3) 纹理比例/偏移：13.2 px/mm、y 偏移 54 px，与 generateImage
+    #      保比缩放后居中**精确吻合**（min(3960/300,2880/210)=13.2,
+    #      (2880-210*13.2)/2=54）  ✅
+    #
+    # 剩下的嫌疑：标定板姿态与 CharucoBoard **自身坐标系**的对应关系。
+    # 上面两个验证都只证明了"自洽"，没证明与 getChessboardCorners() 全局一致。
+    #
+    # **影响范围有限**：target_detect.detect_charuco 在**真实板纹理**上工作正常
+    # （35 markers / 54 corners，降采样 3.6x 仍可检出），所以这纯粹是
+    # **测试夹具**的问题。ChArUco 的最终验证等真实打印板（计划 D5）。
     # 实测：渲染图原图 0 markers，左右翻转 35、上下翻转 35、180° 翻转 0。
     # 说明纹理采样环节把板子翻转了。这是**测试夹具**的问题，不是
     # target_detect.detect_charuco 的问题 —— 后者在真实板纹理上工作正常
