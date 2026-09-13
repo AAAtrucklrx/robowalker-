@@ -121,9 +121,10 @@ def estimate_imu_noise(t: np.ndarray, gyro: np.ndarray, accel: np.ndarray,
         # 噪声密度：在最接近 tau_ref 的点取 adev*sqrt(tau)
         i = int(np.argmin(np.abs(taus - tau_ref)))
         n_density = adev[i] * np.sqrt(taus[i])
-        # 零偏不稳定性：曲线最低点
+        # 零偏不稳定性：曲线最低点（取三轴平均曲线的最低点所在的那个 tau，
+        # 然后取该 tau 上三个轴各自的值 —— 不要用标量，否则下面展开会报错）
         j = int(np.argmin(adev.min(axis=1)))
-        bias_instab = adev.min(axis=1)[j] / 0.664
+        bias_instab = adev[j] / 0.664
         out[name] = {
             "noise_density": [float(v) for v in n_density],
             "noise_density_unit": f"{unit}/sqrt(Hz)",

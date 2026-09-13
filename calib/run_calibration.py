@@ -321,8 +321,9 @@ def run(args) -> int:
          "time_offset": {**{k: v for k, v in sync.items()
                             if k not in ("grid_taus", "grid_costs")},
                          "tau_s": tau},
-         "imu_noise": {k: {kk: vv for kk, vv in v.items()
-                           if kk not in ("taus_s", "adev")}
+         "imu_noise": {k: ({kk: vv for kk, vv in v.items()
+                            if kk not in ("taus_s", "adev")}
+                           if isinstance(v, dict) else v)
                        for k, v in (imu_noise or {}).items()}},
         {"session": session_root,
          "board": str(spec),

@@ -105,13 +105,45 @@ def _classic_flags():
     return f
 
 
+def _reorder_to_match_detector(op: np.ndarray, spec: BoardSpec, detector: str):
+    """把 object points 重排成**与检测器返回顺序一致**。
+
+    ⚠️ 这是本项目最隐蔽的一个 bug，必须讲清楚：
+
+    ``findChessboardCornersSB`` 返回的角点顺序在 **x 方向与
+    ``object_points()`` 的约定相反**。如果直接把两者配对，得到的是一个
+    **镜像对应**——而棋盘格在 x 反序下是**对称**的，所以
+    ``calibrateCamera`` **照样能收敛、残差看起来也不大**，但内参会系统性偏掉。
+
+    实测（合成数据，真值 fx=1100）：
+      · 不重排：fx = 1135.66（**偏 +3.2%**），与 ROS camera_calibration
+        （fx = 1099.53，几乎命中真值）在投影意义上差 RMS 18.4 px
+      · 重排后：与 ROS 一致
+
+    **是"与成熟工具对比"这一项验证把这个 bug 抓出来的** —— 只跑自检
+    发现不了，因为自检的渲染器和检测器用的是同一个错误约定。
+
+    经典 ``findChessboardCorners`` 用的是常规行主序（与 ``object_points()``
+    一致），所以只对 SB 做重排。
+    """
+    if detector != "SB":
+        return op
+    cols, rows = int(spec.pattern_size[0]), int(spec.pattern_size[1])
+    if op.shape[0] != cols * rows:
+        return op
+    return np.ascontiguousarray(op.reshape(rows, cols, 3)[:, ::-1].reshape(-1, 3))
+
+
 def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
                       refine: bool = True) -> Detection:
-    """检测棋盘格内角点。
+    """检测棋盘格内角点，返回**角点与 3D 点已正确配对**的检测结果。
 
     优先用 ``findChessboardCornersSB``（OpenCV 4.x 的 sector-based 检测器，
     自带亚像素精度、对噪声和模糊鲁棒得多）；不可用时退回
     ``findChessboardCorners`` + ``cornerSubPix``。
+
+    返回的 ``object_points`` 已经按检测器的顺序重排过，调用方（内参标定、
+    PnP）直接配对即可，**不要再自己反序**。
     """
     ps = tuple(int(v) for v in spec.pattern_size)
     op = spec.object_points()
@@ -123,7 +155,9 @@ def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
             # SB 检测器对某些图像会多返回一组首尾重复点，剔掉
             if len(c) > len(op):
                 c = c[: len(op)]
-            return Detection(True, c, op, method="SB")
+            return Detection(True, c,
+                             _reorder_to_match_detector(op, spec, "SB"),
+                             method="SB")
 
     ok, corners = cv2.findChessboardCorners(gray, ps, flags=_classic_flags())
     if not ok:
@@ -132,7 +166,9 @@ def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
         # 亚像素细化：粗检测的角点误差能差一个量级，这一步不能省
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-    return Detection(True, corners.astype(np.float32), op, method="classic+subpix")
+    return Detection(True, corners.astype(np.float32),
+                     _reorder_to_match_detector(op, spec, "classic"),
+                     method="classic+subpix")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -201,7 +237,7 @@ def detect(gray: np.ndarray, spec: BoardSpec) -> Detection:
 
 def solve_pnp_board(object_points, image_points, K, dist, prev_R=None,
                     prev_t=None, pattern_size=None,
-                    corner_order: str = "x_reversed") -> dict:
+                    corner_order: str = "canonical") -> dict:
     """解标定板位姿：**顺序自适应** + **平面二义性消解**。
 
     ⚠️ 两个都必须做，而且它们是**两个不同的问题**，别混为一谈
@@ -216,8 +252,9 @@ def solve_pnp_board(object_points, image_points, K, dist, prev_R=None,
     应对：**必须固定用哪一种顺序**，不能"两种都试然后按重投影误差选"——
     实测那样做会全崩，因为棋盘格在 x 反序下是对称的，**两种顺序都能找到
     重投影一样好的位姿**（镜像二义性），按误差选等于抛硬币。
-    实测结论：``findChessboardCornersSB`` 需要 ``x_reversed``。
-    用 ``try_order_flip=True`` 可切换（仅供实验，不要用于自动选择）。
+    **但请注意**：``detect()`` 现在已经在源头把 object points 重排成与检测器
+    一致了（见 ``_reorder_to_match_detector``），所以这里**默认不再重复反序**。
+    参数 ``corner_order="x_reversed"`` 只留给"直接喂原始 object_points"的场景。
 
     **(B) 平面目标二义性**
 
