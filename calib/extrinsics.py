@@ -224,7 +224,7 @@ def _savgol(y, dt, window, polyorder, deriv=0, axis=0):
 
 def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
                     R_IC, tau: float = 0.0, gravity: float = 9.80665,
-                    pos_sigma: float = 0.0015, rot_sigma: float = 0.002,
+                    pos_sigma: float | None = None, rot_sigma: float = 0.002,
                     smooth_window: int = 9, polyorder: int = 3,
                     use_spline: bool = True, estimate_gravity: bool = True,
                     verbose: bool = False) -> dict:
@@ -259,8 +259,29 @@ def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
     if use_spline:
         from trajectory import SplineTrajectory
 
-        traj = SplineTrajectory.fit(t, R_WC, p_WC, pos_sigma=pos_sigma,
-                                    rot_sigma=rot_sigma)
+        # ★ pos_sigma 必须与**实际的 PnP 位置噪声**匹配，否则样条过拟合，
+        #   二阶导噪声被放大，杠杆臂直接崩。实测（真值 |r| = 4.25 cm）：
+        #       sigma=1.5mm（实际噪声~6mm）→ 杠杆臂误差 8.31 cm，LS 残差 3.18
+        #       sigma=6.0mm              → 杠杆臂误差 0.61 cm，LS 残差 0.041
+        #   而实际噪声事先并不知道，所以这里**自动标定**：迭代到
+        #   "拟合残差 ≈ sigma"（统计上正确的平滑量），并带阻尼避免振荡。
+        #   最优区很平坦（3~12 mm 结果都在 1 cm 内），所以不敏感。
+        if pos_sigma is None:
+            sg = 0.005
+            for _ in range(10):
+                tr = SplineTrajectory.fit(t, R_WC, p_WC, pos_sigma=sg,
+                                          rot_sigma=rot_sigma)
+                res = tr.quality()["pos_residual_rms_m"]
+                if sg > 0 and abs(res - sg) / sg < 0.03:
+                    break
+                sg = 0.4 * sg + 0.6 * max(res, 1e-6)
+            pos_sigma, traj = sg, tr
+            if verbose:
+                print(f"  pos_sigma 自动标定 = {pos_sigma*1000:.2f} mm "
+                      f"(拟合残差 {res*1000:.2f} mm)")
+        else:
+            traj = SplineTrajectory.fit(t, R_WC, p_WC, pos_sigma=pos_sigma,
+                                        rot_sigma=rot_sigma)
         R_WC_s = traj.R(t)
         a_WC = traj.a(t)
         Rdd = traj.Rdd(t)
