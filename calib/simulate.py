@@ -111,17 +111,30 @@ class Trajectory:
     # 只会让 C2/C3 悄悄崩掉。（C1 的 random_pose 显式把板放在正前方，
     # 所以没暴露出这个问题。）
     R_base: np.ndarray = field(default_factory=lambda: np.diag([1.0, -1.0, -1.0]))
+    # 开头的**静止段**时长（秒）。真实采集协议要求"开头保持 2 秒完全静止"，
+    # 因为零偏标定与重力对齐只能靠静止段。合成数据也必须带上这一段，
+    # 否则零偏标定会被（正确地）拒绝，未补偿的加速度零偏比杠杆臂信号还大，
+    # 平移外参直接废掉 —— 这个坑实测踩过。
+    # 用五次平滑斜坡（C² 连续）保证起步时的一阶/二阶导数连续，不产生加速度尖峰。
+    lead_in_s: float = 0.0
+
+    def _ramp(self, t):
+        if self.lead_in_s <= 0:
+            return 1.0
+        x = np.clip(np.asarray(t, float) / self.lead_in_s, 0.0, 1.0)
+        return x ** 3 * (x * (6.0 * x - 15.0) + 10.0)      # quintic smoothstep
 
     def rotvec(self, t):
-        return self.rot_amp * np.sin(self.rot_freq * t + self.rot_phase)
+        return self._ramp(t) * self.rot_amp * np.sin(self.rot_freq * t + self.rot_phase)
 
     def R_WC(self, t) -> np.ndarray:
         """相机系 -> 世界系 的旋转。"""
-        R, _ = cv2.Rodrigues(self.rotvec(t))
+        R, _ = cv2.Rodrigues(np.asarray(self.rotvec(t), float).reshape(3))
         return R @ self.R_base
 
     def p_WC(self, t) -> np.ndarray:
-        return self.center + self.pos_amp * np.sin(self.pos_freq * t + self.pos_phase)
+        return self.center + self._ramp(t) * self.pos_amp * np.sin(
+            self.pos_freq * t + self.pos_phase)
 
     # -- 导数（中心差分；轨迹是解析的，所以差分精度极高）------
     def derivatives(self, t, h1: float = 1e-4, h2: float = 2e-3):

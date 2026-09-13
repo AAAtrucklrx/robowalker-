@@ -198,47 +198,96 @@ def estimate_offset(cam_times: np.ndarray, cam_R: np.ndarray,
 # ══════════════════════════════════════════════════════════════
 #  IMU 预处理（C3 也要用）
 # ══════════════════════════════════════════════════════════════
-def static_segment(accel: np.ndarray, gyro: np.ndarray,
-                   accel_std_max: float = 0.08, gyro_std_max: float = 0.03,
-                   min_len: int = 100) -> np.ndarray:
+def static_segment(t: np.ndarray, accel: np.ndarray, gyro: np.ndarray,
+                   accel_std_max: float = 0.05, gyro_std_max: float = 0.02,
+                   min_duration_s: float = 1.0,
+                   window_s: float = 0.2) -> np.ndarray:
     """找出"完全静止"的样本（布尔掩码）。
 
-    静止段是零偏标定与重力对齐的唯一可靠来源，所以采集时开头务必静置 2 秒。
+    静止段是零偏标定与重力对齐的**唯一**可靠来源，所以采集时开头务必静置 2 秒。
+
+    ⚠️ 这个函数踩过一次大坑：**最初按"样本数"定窗口**（25 个样本），在 1 kHz
+    数据上窗口只有 25 ms，平滑运动中的一小段也很容易标准差低于阈值 ——
+    结果把**整段运动数据判成了静止**（6999/7000 样本），于是减掉一个凭空的
+    陀螺零偏，后面 R_WI 积分、时间对齐、外参**全部悄悄错掉且不报错**。
+
+    现在改成三条硬性约束：
+
+    1. 窗口按**秒**算（默认 0.2 s），不同采样率下行为一致；
+    2. 阈值收紧（默认 0.05 m/s² / 0.02 rad/s）；
+    3. **只保留连续时长 ≥ ``min_duration_s`` 的段** —— 零散的短窗不算静止。
     """
+    t = np.asarray(t, float)
     a = np.asarray(accel, float)
     g = np.asarray(gyro, float)
-    # 滑动窗口标准差
-    win = max(11, min_len // 4)
-    ok = np.zeros(len(a), bool)
-    for i in range(len(a) - win):
+    n = len(t)
+    if n < 16:
+        return np.zeros(n, bool)
+    dt = float(np.median(np.diff(t)))
+    win = max(11, int(round(window_s / max(dt, 1e-9))))
+
+    ok = np.zeros(n, bool)
+    for i in range(n - win):
         if a[i:i + win].std(axis=0).max() < accel_std_max and \
            g[i:i + win].std(axis=0).max() < gyro_std_max:
             ok[i:i + win] = True
-    return ok
+
+    # 只保留足够长的连续段
+    need = max(1, int(round(min_duration_s / max(dt, 1e-9))))
+    out = np.zeros(n, bool)
+    i = 0
+    while i < n:
+        if ok[i]:
+            j = i
+            while j < n and ok[j]:
+                j += 1
+            if j - i >= need:
+                out[i:j] = True
+            i = j
+        else:
+            i += 1
+    return out
 
 
-def estimate_bias(accel: np.ndarray, gyro: np.ndarray,
-                  mask: np.ndarray | None = None) -> dict:
+def estimate_bias(t: np.ndarray, accel: np.ndarray, gyro: np.ndarray,
+                  mask: np.ndarray | None = None,
+                  accel_std_max: float = 0.05, gyro_std_max: float = 0.02,
+                  min_duration_s: float = 1.0) -> dict:
     """从静止段估计陀螺零偏与加速度零偏。
 
-    陀螺零偏直接就是静止段的均值。加速度零偏需要先知道重力方向与大小，
-    这里采用"先做重力对齐，再取残差"的做法：
-    用静止段加速度均值确定 IMU 系下重力的方向，零偏 = 均值 - 该方向上的 9.80665。
+    陀螺零偏直接就是静止段的均值。加速度零偏采用"先定重力方向，再取残差"：
+    用静止段加速度均值确定 IMU 系下重力方向，零偏 = 均值 − 该方向 × 9.80665。
+
+    **带一道安全阀**：若"静止段"占了数据的 50% 以上就判定失败并给出原因 ——
+    标定采集本来就是让人动的，整段都静止说明阈值把运动数据也吞了。
+    宁可明确报错（退回不减零偏），也不要悄悄减掉一个错误的零偏。
     """
+    t = np.asarray(t, float)
     a = np.asarray(accel, float)
     g = np.asarray(gyro, float)
     if mask is None:
-        mask = static_segment(a, g)
-    if mask.sum() < 20:
-        return {"ok": False, "n_static": int(mask.sum()),
-                "reason": "找不到足够的静止段（采集时开头请静置 2 秒）"}
+        mask = static_segment(t, a, g, accel_std_max, gyro_std_max,
+                              min_duration_s)
+    n_static = int(np.sum(mask))
+    frac = n_static / max(len(a), 1)
+    if n_static < 200:
+        return {"ok": False, "n_static": n_static, "static_fraction": frac,
+                "reason": f"静止段只有 {n_static} 个样本（<200）。"
+                          f"采集时开头请完全静置 2 秒以上"}
+    if frac > 0.5:
+        return {"ok": False, "n_static": n_static, "static_fraction": frac,
+                "reason": f"静止段占了 {frac*100:.1f}% 的数据 —— 标定采集本来就"
+                          f"要让人动起来，这不合理，说明静止判据把运动数据也吞了。"
+                          f"已放弃零偏标定（不减零偏比减错零偏差）"}
     a_m = a[mask].mean(axis=0)
     g_m = g[mask].mean(axis=0)
     g_dir = a_m / np.linalg.norm(a_m)
     accel_bias = a_m - g_dir * 9.80665
     return {
         "ok": True,
-        "n_static": int(mask.sum()),
+        "n_static": n_static,
+        "static_fraction": frac,
+        "static_mask": mask,
         "gyro_bias": g_m,
         "accel_bias": accel_bias,
         "gravity_dir_in_imu": g_dir,

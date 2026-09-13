@@ -356,6 +356,7 @@ def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
         "residual_rms_ms2": rms,
         "cond": cond,
         "n_samples": int(len(t)),
+        "pos_sigma_used": float(pos_sigma),
         "method": ("spline" if use_spline else "savgol")
                   + ("+gravity-joint" if estimate_gravity else ""),
         "trajectory_quality": traj.quality() if traj is not None else None,
@@ -435,7 +436,7 @@ def main() -> int:
         return 2
 
     # 零偏
-    bias = estimate_bias(sess.imu.accel, sess.imu.gyro)
+    bias = estimate_bias(sess.imu.t, sess.imu.accel, sess.imu.gyro)
     print(f"零偏标定：{bias}")
     if bias.get("ok"):
         gyro = sess.imu.gyro - bias["gyro_bias"]
