@@ -69,11 +69,14 @@ import threading
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "calib"))
 
 from camera import open_camera  # noqa: E402
 from imu_h7 import H7Imu, validate  # noqa: E402
+from target_detect import BoardSpec  # noqa: E402
 
 IMU_HEADER = ("# timestamp gx gy gz ax ay az   "
               "(s, rad/s x3, m/s^2 x3; timestamp = 主机单调时钟)")
@@ -115,8 +118,96 @@ class ImuCollector:
         return float(np.rad2deg(np.linalg.norm(g, axis=1).mean()))
 
 
+class BoardTracker:
+    """用标定板的**表观尺寸**估计深度跨度 —— 采集时的硬性质量指标。
+
+    为什么需要它
+    ------------------------------------------------------------------
+    受控实验证明（``tools/experiment_depth_diversity.py``）：相机相对标定板的
+    **深度跨度**决定内参能不能解出来。
+
+    | 深度跨度 | fx 误差 | k3（真值 0） | 重投影 RMS |
+    |---|---|---|---|
+    | 1.0x | **+4.17%** | -0.047 | 0.128 px |
+    | 1.8x | -0.12% | -0.013 | 0.149 px |
+    | 3.3x | +0.31% | +0.004 | 0.153 px |
+
+    **三行的重投影误差几乎一样** —— 只在同一距离换角度，内参是错的但残差不报警。
+
+    原理：板在画面里的面积 ∝ 1/z²，所以 ``sqrt(area)`` 的 max/min **就是深度跨度**。
+    不需要相机内参，采集时就能实时判断。
+
+    实现上为了不拖慢采集，每 ``every`` 帧才检测一次，且先降采样到 ~640 宽。
+
+    离线验证（喂 synth_01 的 180 帧）：估计 2.15x，轨迹真值 1.92x，
+    偏差 12% 且偏保守方向 —— 作为采集时的实时指标足够。
+    （它用 5/95 分位而不是极值，所以会略偏小/偏稳；投影面积还受板姿态影响，
+    所以这是**代理指标**，用来发现"深度基本没变"这种致命情况。）
+    """
+
+    def __init__(self, spec, every: int = 5, downscale_to: int = 640):
+        self.spec = spec
+        self.every = max(1, every)
+        self.downscale_to = downscale_to
+        self.sizes: list[float] = []
+        self.n_seen = 0
+        self.n_detected = 0
+
+    def offer(self, image) -> float | None:
+        """喂一帧（可以随便喂，内部按 every 抽稀）。返回当前的 sqrt(area)。"""
+        import cv2
+
+        self.n_seen += 1
+        if self.n_seen % self.every:
+            return self.sizes[-1] if self.sizes else None
+        gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        if w > self.downscale_to:
+            sc = self.downscale_to / w
+            gray = cv2.resize(gray, (int(w * sc), int(h * sc)),
+                              interpolation=cv2.INTER_AREA)
+        try:
+            from target_detect import detect
+            d = detect(gray, self.spec)
+        except Exception:  # noqa: BLE001
+            return None
+        if not d.found or d.image_points is None:
+            return None
+        p = d.image_points.reshape(-1, 2)
+        area = float((p[:, 0].ptp()) * (p[:, 1].ptp()))
+        self.n_detected += 1
+        self.sizes.append(area ** 0.5)
+        return self.sizes[-1]
+
+    # -- 指标 --------------------------------------------------
+    def depth_span(self) -> float:
+        """估计的深度跨度（max/min）。板只在一个距离上时接近 1.0。"""
+        if len(self.sizes) < 5:
+            return float("nan")
+        s = np.asarray(self.sizes)
+        return float(np.percentile(s, 95) / max(np.percentile(s, 5), 1e-9))
+
+    def report(self) -> str:
+        if len(self.sizes) < 5:
+            return (f"  标定板检测 {self.n_detected} 次，样本不足，"
+                    f"无法评估深度多样性")
+        span = self.depth_span()
+        ok = span >= 2.0
+        lines = [
+            f"  标定板检出 {self.n_detected}/{self.n_seen // self.every} 次",
+            f"  估计深度跨度 ≈ {span:.2f}x  "
+            f"{'✅ 合格（≥2x）' if ok else '❌ 太小！内参（fx 与畸变）会不可辨识，且残差不报警'}",
+        ]
+        if not ok:
+            lines += [
+                "  ⇒ 重采：让标定板走遍**近 / 中 / 远**三档距离。",
+                "     受控实验：深度 1.0x 时 fx 偏 +4.17%，3.3x 时只偏 +0.31%。",
+            ]
+        return "\n".join(lines)
+
+
 def write_outputs(out: Path, imu_frames, raw: bytes, cam_info: dict,
-                  cam_ts_rows: list) -> None:
+                  cam_ts_rows: list, board_report: str | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     if imu_frames:
@@ -171,6 +262,9 @@ def write_outputs(out: Path, imu_frames, raw: bytes, cam_info: dict,
         print(f"  采样率    {st['采样率_Hz']:.3f} Hz")
         print(f"  时间戳步长非1的帧数  {st['时间戳步长_非1帧数']}  (应为 0)")
     print(f"  设备时间戳：{'有（camera_timestamps.csv）' if cam_ts_rows and cam_ts_rows[0]['device_ts'] else '无'}")
+    if board_report:
+        print("\n【采集质量】")
+        print(board_report)
     print("\n下一步：")
     print(f"  .venv/bin/python calib/run_calibration.py --session {out} \\")
     print(f"      --pattern <内角点> --square-mm <方格毫米>")
@@ -195,6 +289,12 @@ def main() -> int:
                     help=">0 进入无窗口自测：自动抓 N 帧后退出")
     ap.add_argument("--frame-interval", type=float, default=0.2)
     ap.add_argument("--auto-interval", type=float, default=0.25)
+    ap.add_argument("--pattern", default=None,
+                    help="内角点数（如 9x6）。给了就实时评估**深度多样性** —— "
+                         "受控实验证明深度跨度 <2x 时内参不可辨识，而残差不报警")
+    ap.add_argument("--board-type", default="chessboard",
+                    choices=["chessboard", "charuco"])
+    ap.add_argument("--square-mm", type=float, default=25.0)
     ap.add_argument("--imu-only", action="store_true")
     ap.add_argument("--seconds", type=float, default=0.0)
     args = ap.parse_args()
@@ -253,6 +353,13 @@ def main() -> int:
     frame_iter = cap.frames(None) if cap is not None else None
     idx = 0
 
+    tracker = None
+    if args.pattern:
+        c, r = (int(v) for v in args.pattern.lower().split("x"))
+        tracker = BoardTracker(BoardSpec(args.board_type, (c, r),
+                                         args.square_mm / 1000.0))
+        print(f"深度多样性监测已开启（板 {args.board_type} {args.pattern}）")
+
     def save_one(frame) -> None:
         nonlocal idx
         import cv2
@@ -262,6 +369,8 @@ def main() -> int:
         cam_ts_rows.append({"frame": idx, "filename": name,
                             "host_ts": frame.host_ts, "device_ts": frame.device_ts})
         idx += 1
+        if tracker is not None:
+            tracker.offer(frame.image)
 
     try:
         if args.frames > 0:
@@ -283,10 +392,14 @@ def main() -> int:
                     save_one(f); last_auto = now
                 disp = cv2.cvtColor(f.image, cv2.COLOR_GRAY2BGR) \
                     if f.image.ndim == 2 else f.image.copy()
+                if tracker is not None:
+                    tracker.offer(f.image)
                 gdps = collector.recent_gyro_dps()
                 warn = bool(idx > 3 and gdps < MIN_GYRO_DPS)
+                span = tracker.depth_span() if tracker is not None else float("nan")
+                span_txt = (f"  depth={span:.1f}x" if np.isfinite(span) else "")
                 txt = (f"saved={idx} auto={'ON' if auto else 'off'}  "
-                       f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f})"
+                       f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f}){span_txt}"
                        + ("  TOO SLOW!" if warn else ""))
                 cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             (0, 0, 255) if warn else (0, 220, 0), 2)
@@ -306,7 +419,8 @@ def main() -> int:
         collector.stop()
         imu.close()
 
-    write_outputs(out, collector.frames, bytes(imu.raw), cam_info, cam_ts_rows)
+    rep = tracker.report() if tracker is not None else None
+    write_outputs(out, collector.frames, bytes(imu.raw), cam_info, cam_ts_rows, rep)
     return 0
 
 
