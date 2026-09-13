@@ -60,46 +60,72 @@ PYTHONPATH=.bootstrap python3 -m virtualenv --system-site-packages .venv
 
 ## 4. 程序运行方法
 
+### 4.1 真实数据：两条命令出结果
+
 ```bash
 cd ~/calib_ws
 
-# 第 0 步：硬件自检（相机、串口、依赖一次查完）
-.venv/bin/python tools/probe_hardware.py
-
-# 第 1 步：IMU 协议自检（抓 3 秒，验证帧格式/采样率/四元数自洽）
+# ① 硬件自检（30 秒）
 python3 calib/imu_h7.py --port /dev/ttyACM0 --seconds 3
+python3 calib/camera.py --source hik --grab 3 --out /tmp/cam
 
-# 第 2 步：只采 IMU（不接相机，最常用来确认硬件还活着）
-.venv/bin/python tools/capture_h7.py --imu-only --seconds 5 --out data/probe
+# ② 采集（工具会实时提示角速度与深度跨度，不合格当场红色警告）
+.venv/bin/python tools/capture_h7.py --out data/session_01 \
+    --camera-source hik --width 1624 --height 1240 --pixel-format Mono8 \
+    --exposure 200000 --gain 20 --frame-rate 4 \
+    --pattern 8x5 --square-mm 42 --serial /dev/ttyACM0
 
-# 第 3 步：采集数据。按键 s=存帧 a=自动连拍 q=结束
-.venv/bin/python tools/capture_h7.py \
-    --out data/session_01 --camera 0 --width 640 --height 480 \
-    --serial /dev/ttyACM0 --lock-exposure
+# ③ 标定：一条命令跑完 C1→C2→C3→C4，自动生成报告
+.venv/bin/python calib/run_calibration.py --session data/session_01 \
+    --pattern 8x5 --square-mm 42
 
-# 第 4 步：运动激励体检（判断这组数据够不够解外参）
-.venv/bin/python tools/check_motion.py --imu data/session_01/imu.txt
-
-# 第 5 步：标定（待实现）
-.venv/bin/python calib/run_calibration.py --config config/calibration.yaml
-
-# 无窗口自测（验证整条链路，不弹窗）
-.venv/bin/python tools/capture_h7.py --out /tmp/selftest --frames 3
+# 只看内参（快，用来先判断数据质量）
+.venv/bin/python calib/run_calibration.py --session data/session_01 \
+    --pattern 8x5 --square-mm 42 --only-intrinsics
 ```
+
+> `--pattern` 填**内角点数**，不是方格数：9×6 方格 → `8x5`。
+> 板子怎么选、印多大、可用距离区间见 **[doc/标定板选择指南.md](doc/标定板选择指南.md)**。
+
+### 4.2 验证与对照
+
+```bash
+# 合成自检（不依赖任何硬件，证明算法链路正确）
+.venv/bin/python tools/selftest_intrinsics.py        # C1：点级 + 图像级两层
+.venv/bin/python tools/selftest_pipeline.py --step 2e-3   # C1+C2+C3 五项
+
+# 采集工具离线整链路自测（伪造 H7 串口 + 真实 UVC 相机）
+.venv/bin/python tools/selftest_capture.py
+
+# 与成熟工具对比（ROS camera_calibration，免 sudo）
+bash tools/setup_ros_bypass.sh
+.venv/bin/python tools/compare_with_ros.py --session data/session_01 \
+    --pattern 8x5 --square-mm 42
+
+# 受控实验：深度多样性对内参可辨识性的影响
+.venv/bin/python tools/experiment_depth_diversity.py
+
+# 造一份落盘的合成数据集（用于端到端验证交付物本身）
+.venv/bin/python tools/make_synthetic_session.py --out data/synth_01
+```
+
+### 4.3 采集时的动作要求
+
+标定精度**主要取决于采集动作的质量**，而不是算法。`capture_h7.py` 会实时盯着下面第 2、4 条：
+
+1. 开头保持 **3 秒完全静止**（零偏标定与重力对齐**只能**靠静止段，没有这段后面全废）；
+2. 绕 **x / y / z 三个轴各自快速转动**（只绕一个轴 → 手眼标定数学上退化）。
+   **目标角速度 ≥ 90 °/s** —— 实测 `τ 分辨率 ≈ 角度残差 / 角速度`，转慢了时间对齐必不准。
+   工具会在 < 40 °/s 时红色警告；
+3. 手持做 **小幅平移**（纯旋转无法确定平移外参）；
+4. 让标定板走遍**画面四角与中心**、覆盖不同倾角，并且**走遍近 / 中 / 远三档距离**。
+   **深度跨度必须 ≥ 2×** —— 受控实验证明跨度 1.0× 时 `fx` 偏 **+4.17%**，
+   而重投影误差只有 0.13 px **完全不报警**。工具会实时显示 `depth=N.Nx`；
+5. 标定板与相机 IMU 之间保持**机械固连**，全程不要碰到相对位置
+   （USB 线一定要做**应力释放**，别让线拽着 IMU）。
 
 > 旧工具 `tools/capture_dataset.py` 面向**文本协议**的 IMU（维特 ASCII 等），
 > 与当前这块二进制 H7 板不兼容，保留仅作参考。当前硬件请用 `tools/capture_h7.py`。
-
-
-### 采集时的动作要求
-
-标定精度**主要取决于采集动作的质量**，而不是算法：
-
-1. 开头保持 **2 秒完全静止**（用于零偏标定与重力方向对齐）；
-2. 缓慢绕 **x / y / z 三个轴各自转动**若干圈（只绕一个轴转是手眼标定无解的头号原因）；
-3. 手持做 **小幅平移**（纯旋转无法确定平移外参）；
-4. 让标定板在图像里走遍 **画面四角与中心**、并覆盖不同 **倾角**；
-5. 标定板与相机 IMU 之间保持**机械固连**，全程不要碰到相机与 IMU 的相对位置。
 
 ## 5. 输入数据格式
 
@@ -444,3 +470,59 @@ abcd 0000 713d aabf | 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000
 .venv/bin/python tools/selftest_serial.py --format csv       # 数字列格式
 .venv/bin/python tools/selftest_serial.py --algo-deg         # 验证 deg/s、g 的单位换算
 ```
+
+---
+
+## 13. 工具与文档索引
+
+### 13.1 源码 `calib/`（标定核心，全部纯 numpy/scipy/OpenCV）
+
+| 文件 | 作用 |
+|---|---|
+| `imu_h7.py` | H7 IMU 二进制协议解析（82 字节帧 @1 kHz，含完整逆向证据链；直接运行=协议自检） |
+| `camera.py` | 统一相机层：U3V(aravis) + UVC(OpenCV)，输出**设备硬件时间戳 + 主机单调时钟**双时间戳 |
+| `target_detect.py` | 棋盘格(SB 检测器) / ChArUco 检测；`solve_pnp_board` 处理**角点顺序约定**与**平面二义性** |
+| `intrinsics.py` | **C1** 内参（张正友 + Brown-Conrady），**强制 train/val 分离**验证 |
+| `sync.py` | **C2** 时间对齐（转动角度匹配，**不依赖外参**）+ 零偏标定 + 陀螺积分 |
+| `extrinsics.py` | **C3** 外参：手眼 AX=XB（四解法 + 一致簇投票 + 帧级异常剔除）+ 杠杆臂（重力联合估计 + Huber IRLS） |
+| `trajectory.py` | **B样条轨迹**：四元数半球对齐 + 归一化四元数的解析一/二阶导（比数值微分精度高约 100 倍） |
+| `validate.py` | **C4** 验证：合格判据表 + Allan 方差 + 交叉验证 + Bootstrap + Markdown 报告生成 |
+| `run_calibration.py` | **主入口**：配置驱动，一条命令跑完 C1→C2→C3→C4 |
+| `io_data.py` | 数据集与结果读写（YAML/JSON 可回读） |
+| `simulate.py` | 数字孪生：真值已知的相机+IMU 刚体，用于合成验证 |
+
+### 13.2 工具 `tools/`
+
+| 工具 | 作用 |
+|---|---|
+| `capture_h7.py` | **数据采集**（工业相机 / UVC + H7 IMU），带**角速度**与**深度多样性**实时反馈 |
+| `make_board.py` | 生成**页面尺寸精确到 0.01 mm** 的可打印标定板（附 100 mm 校验尺） |
+| `compare_with_ros.py` | **与成熟工具对比**：ROS `camera_calibration` 无头标定 + **投影函数级**对比 |
+| `setup_ros_bypass.sh` | **免 sudo** 抽出 ROS `camera_calibration`（不需要 topic / GUI / 相机） |
+| `selftest_intrinsics.py` | C1 两层自检（点级验数学 / 图像级验端到端） |
+| `selftest_pipeline.py` | C1+C2+C3 五项自检（含手眼约定校验、模拟器导数精度） |
+| `selftest_capture.py` | 采集工具**离线整链路自测**（伪造 H7 串口 + 真实 UVC 相机） |
+| `experiment_depth_diversity.py` | 受控实验：**深度跨度**对内参可辨识性的影响 |
+| `make_synthetic_session.py` | 造一份**落盘**的合成数据集（含真值），用于端到端验证交付物 |
+| `probe_hardware.py` / `check_motion.py` | 硬件自检 / 运动激励体检（早期工具，仍可用） |
+
+### 13.3 文档 `doc/`
+
+| 文档 | 内容 |
+|---|---|
+| **[标定板选择指南.md](doc/标定板选择指南.md)** | 板子该印多大、可用距离区间、打印 6 要点 |
+| **[答辩材料.md](doc/答辩材料.md)** | 60 秒开场白、验收 8 条应答、答辩 8 问详解、**失效边界**、演示脚本、可能追问的硬问题 |
+| **[对标RM主流做法.md](doc/对标RM主流做法.md)** | RM 圈通用做法（相机→云台枪管 + 编码器位姿）与我们的差异 |
+| **[方法定位与主流对比.md](doc/方法定位与主流对比.md)** | 三大流派、逐环节对照、优势/劣势/缺口 |
+| **[算法清单与可选高级方法.md](doc/算法清单与可选高级方法.md)** | 已用算法 + 可升级方向 + 优先级建议 |
+| **[H7_IMU协议.md](doc/H7_IMU协议.md)** | 协议逆向结论与证据链 |
+| **[实施计划_5天.md](doc/实施计划_5天.md)** / **[项目状态汇报_Camera-IMU标定.md](doc/项目状态汇报_Camera-IMU标定.md)** | 计划与进度汇报 |
+| `相机取流诊断.md` / `IMU板排错清单.md` / `ROS2上手说明.md` | 历史排查记录 |
+
+### 13.4 三条对采集最关键的实测结论
+
+1. **角速度决定时间对齐精度**：`τ 分辨率 ≈ 角度残差 / 角速度`。转慢了 τ 必不准 → 目标 **≥ 90 °/s**。
+2. **深度跨度决定内参可辨识性**：跨度 1.0× 时 `fx` 偏 **+4.17%**，而重投影误差只有 0.13 px
+   **不会报警** → 必须走遍近/中/远，**跨度 ≥ 2×**。
+3. **开头静止段是零偏标定的唯一来源**：没有它，陀螺零偏只能被（正确地）拒绝，
+   未补偿的零偏会污染后面每一步。
