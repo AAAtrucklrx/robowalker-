@@ -299,8 +299,16 @@ calib_ws/
   `sudo bash ~/calib_ws/tools/setup_permissions.sh`（脚本已更新，含 `0483:6666`）。
 - **U3V 相机对 USB 口非常敏感**：换口前 aravis 报 `USB3Vision write_memory timeout`，
   换到机身原生 USB3 口后立刻正常。**遇到"时好时坏"先怀疑线/口，不要先怀疑库。**
-- aravis 的 Python 绑定需要额外的 29.7 kB 包：`sudo apt install gir1.2-aravis-0.8`。
-  没装时 `calib/camera.py` 会直接打印这条命令。临时方案见该文件 docstring。
+- aravis 的 Python 绑定（`gir1.2-aravis-0.8`，29.7 kB）**本机已安装**，可以直接用
+  `calib/camera.py`。换机器时需要 `sudo apt install gir1.2-aravis-0.8`；
+  没有 sudo 时的临时方案见 `calib/camera.py` 的 docstring。
+- **C3 平移外参 `t_IC`（杠杆臂）当前不可用** —— 已定位到数值原因：
+  方程本身精确正确（真值代入残差 4e-15），但 `|b| = 0.059 m/s²` 是
+  `|R_WI·a_meas| = 9.82` 相减后剩下的量，**160:1 的抵消**；而 `a_WC` 靠对
+  PnP 位置做二阶数值微分得到，平面目标的深度噪声被放大后淹没了信号
+  （LS 残差 11.1 m/s² ≈ g）。见 `doc/项目状态汇报_Camera-IMU标定.md` §4.1。
+  三条出路：① 尺子量 + 声明不确定度（保底）；② 相机帧率提到 50~100 Hz
+  并做剧烈旋转激励；③ 上 Kalibr 做全批量优化。
 - 相机曝光/增益**必须手动锁定**（`calib/camera.py` 已默认关掉自动模式）；
   自动曝光会让帧率抖动，时间对齐误差变大。
 - 当前无 `v4l-utils`，UVC 参数查看依赖 OpenCV 而非 `v4l2-ctl`。
