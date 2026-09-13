@@ -252,19 +252,23 @@ def run(args) -> int:
             f"{boot['trans_std_m']*1000:.3f} mm，旋转散布 "
             f"{boot['rot_spread_deg']:.4f}°")
 
-    # IMU 噪声（只在有静止段时做）
+    # IMU 噪声（只在有静止段时做）。Allan 方差要求静态数据，且越长越可信；
+    # 但 1~2 秒的静止段也足以给出量级正确的噪声密度，比用占位值强。
     imu_noise = None
     mask = static_segment(sess.imu.t, sess.imu.accel, sess.imu.gyro)
-    if mask.sum() > 2000:
+    if mask.sum() >= 800:
         try:
             imu_noise = V.estimate_imu_noise(sess.imu.t[mask], gyro[mask],
                                              accel[mask])
-            log(f"  Allan 方差：静止段 {int(mask.sum())} 样本 ✅")
+            log(f"  Allan 方差：静止段 {int(mask.sum())} 样本"
+                f"（{mask.sum()*float(np.median(np.diff(sess.imu.t))):.1f} s）"
+                f"{'  ⚠️ 偏短，噪声密度只能当量级参考' if mask.sum() < 20000 else ' ✅'}")
         except ValueError as e:
             log(f"  Allan 方差跳过：{e}")
     else:
         log(f"  Allan 方差跳过：静止段只有 {int(mask.sum())} 样本"
-            f"（需要 >2000，采集时请开头静置 2 秒以上；想标噪声参数建议静置 10 分钟）")
+            f"（需 ≥800 ≈ 0.8 s。采集时开头请完全静置 2 秒以上；"
+            f"想精确标噪声参数建议静置 10 分钟）")
 
     # ── 落盘 ───────────────────────────────────────────────
     rms = c1["validation"].get("rms_px", float("nan"))

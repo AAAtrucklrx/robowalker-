@@ -1,42 +1,64 @@
 #!/usr/bin/env python3
-"""采集 Camera-IMU 标定数据集（适配本机实测硬件）。
+"""采集 Camera-IMU 标定数据集（统一相机层：海康 U3V 工业相机 / 普通 UVC）。
 
-硬件组合（2026-09-13 实测通过）：
-  · 相机：UVC 摄像头（笔记本 ASUS FHD webcam，``/dev/video0``）
-          —— 海康 MV-CS020-10UC 是 U3V 工业相机，**不能用 OpenCV 打开**，
-             见 doc/相机取流诊断.md；取流打通后换 ``--camera-source hik`` 即可。
-  · IMU ：H7_IMU_With_EKF（VID:PID ``0483:6666``，``/dev/ttyACM0``，1 kHz）
+硬件组合
+------------------------------------------------------------------
+* **海康 MV-CS020-10UC**（USB3 Vision）→ ``--camera-source hik``
+  1624×1240 Mono8，支持 ``DeviceTimestamp`` 硬件时间戳
+* **UVC 摄像头**（笔记本自带）→ ``--camera-source 0``
+  算法开发阶段的默认数据源
+* **H7_IMU_With_EKF**（``0483:6666``）→ ``--serial /dev/ttyACM0``，1 kHz
 
-产出（与 README 第 5 节声明格式一致）：:
+采集质量反馈（这一版新增，来自实测结论）
+------------------------------------------------------------------
+C2 时间对齐的精度满足一条硬约束：
+
+    **τ 的时间分辨率 ≈ 角度残差 / 角速度**
+
+实测：合成轨迹只有 31.6 °/s 时，角度残差 0.24° 直接等价成 **7.6 ms** 的
+时间不确定度。所以**转得慢 = 时间对齐必不准**。
+
+本工具会在采集时实时显示角速度，并在太慢时给出红色警告。
+目标：**≥ 90 °/s**。
+
+产出（与 README 第 5 节格式一致）::
 
     <out>/
-    ├── images/000000.png ...      采集到的图像
-    ├── image_timestamps.txt       "<文件名> <主机单调时钟秒>"
-    ├── imu.txt                    "# timestamp gx gy gz ax ay az"（主机时钟，SI 单位）
-    ├── imu_h7_full.csv            板载毫秒 + 六轴 + 欧拉角 + 四元数 + 主机时钟
-    ├── imu_raw.bin                原始串口字节流（可事后重放解析，复核用）
-    └── meta.json                  本次采集的参数与环境
+    ├── images/000000.png ...
+    ├── image_timestamps.txt     "<文件名> <主机单调时钟秒>"  ← 标定程序读这个
+    ├── camera_timestamps.csv    相机时间戳全量（含设备硬件时间戳，若有）
+    ├── imu.txt                  "# timestamp gx gy gz ax ay az"（主机时钟，SI）
+    ├── imu_h7_full.csv          板载毫秒 + 六轴 + 欧拉角 + 四元数 + 主机时钟
+    ├── imu_raw.bin              原始串口字节流（可事后重放复核）
+    └── meta.json                采集参数与环境
 
 用法::
 
-    # 0) 只验 IMU，不接相机（最常用来确认硬件还活着）
+    # 0) 只验 IMU
     .venv/bin/python tools/capture_h7.py --imu-only --seconds 3 --out data/probe
 
-    # 1) 无窗口自测：抓 3 帧，验证整条链路
+    # 1) 无窗口自测
     .venv/bin/python tools/capture_h7.py --out /tmp/selftest --frames 3
 
-    # 2) 正式采集（交互，需要图形界面）
-    .venv/bin/python tools/capture_h7.py --out data/session_01 \
-        --camera 0 --width 640 --height 480 --serial /dev/ttyACM0
+    # 2) 工业相机正式采集
+    .venv/bin/python tools/capture_h7.py --out data/session_01 \\
+        --camera-source hik --width 1624 --height 1240 --pixel-format Mono8 \\
+        --exposure 20000 --gain 12 --frame-rate 10 --serial /dev/ttyACM0
 
-交互按键：``s`` 存一帧 / ``a`` 自动连拍开关 / ``q`` 结束
+    # 3) UVC 相机
+    .venv/bin/python tools/capture_h7.py --out data/session_01 \\
+        --camera-source 0 --width 640 --height 480
 
-采集动作要求（决定标定精度的是动作，不是算法）：
-  1. 开头保持 2 秒完全静止（零偏标定 + 重力对齐）；
-  2. 绕 x / y / z **三个轴分别**缓慢转动若干圈（只绕一个轴 → 手眼标定无解）；
-  3. 手持做**小幅平移**（纯旋转定不出平移外参）；
-  4. 标定板走遍画面四角与中心，并覆盖不同倾角；
-  5. 全程相机与 IMU 的**相对位置绝对不能变**。
+交互按键：``s`` 存一帧 / ``a`` 自动连拍 / ``q`` 结束
+
+**采集动作要求（决定标定精度的是动作，不是算法）**
+
+1. 开头 **静置 3 秒**（零偏标定 + 重力对齐**只能**靠静止段，这段没有就全废）；
+2. 绕 x / y / z **三个轴分别**快速转动若干圈 —— **手腕要快，目标 ≥ 90 °/s**；
+   只绕一个轴转 → 手眼标定在数学上退化；
+3. 做**小幅平移**（纯旋转定不出平移外参）；
+4. 标定板走遍画面四角与中心，覆盖不同倾角；
+5. 全程相机与 IMU 的**相对位置绝对不能变**（USB 线别拽着 IMU）。
 """
 from __future__ import annotations
 
@@ -47,46 +69,19 @@ import threading
 import time
 from pathlib import Path
 
-# 让脚本能直接 import calib/ 下的模块，而不依赖安装成包
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "calib"))
 
+from camera import open_camera  # noqa: E402
 from imu_h7 import H7Imu, validate  # noqa: E402
 
-IMU_HEADER = "# timestamp gx gy gz ax ay az   (s, rad/s x3, m/s^2 x3; timestamp = 主机单调时钟)"
-FULL_HEADER = (
-    "t_board_ms,t_host_s,gx,gy,gz,ax,ay,az,roll,pitch,yaw,qw,qx,qy,qz"
-)
+IMU_HEADER = ("# timestamp gx gy gz ax ay az   "
+              "(s, rad/s x3, m/s^2 x3; timestamp = 主机单调时钟)")
+FULL_HEADER = "t_board_ms,t_host_s,gx,gy,gz,ax,ay,az,roll,pitch,yaw,qw,qx,qy,qz"
 
-
-def open_camera(index: int, width: int, height: int, lock_exposure: bool):
-    """打开 UVC 相机。返回 cv2.VideoCapture，失败抛 RuntimeError。"""
-    import cv2
-
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(
-            f"打不开相机 index={index}。若这是海康工业相机，请改用 MVS SDK 路线"
-            f"（它不是 UVC 设备，OpenCV 无法打开）。"
-        )
-    # 关键：把驱动内部缓冲压到 1 帧。默认缓冲会让"读到帧的时刻"比"曝光时刻"
-    # 晚几十毫秒且不稳定，这是 Camera-IMU 时间对齐最常见的精度杀手。
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if lock_exposure:
-        # V4L2 语义：AUTO_EXPOSURE=1 手动、=3 自动。不同驱动实现有差异，
-        # 失败也不致命，只提示。
-        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-    got_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    got_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    got_fps = cap.get(cv2.CAP_PROP_FPS)
-    print(f"相机已打开: index={index} 实际 {got_w}x{got_h} @ {got_fps:.1f} fps")
-    if (got_w, got_h) != (width, height):
-        print(f"  ⚠️  请求 {width}x{height}，实际拿到 {got_w}x{got_h}，"
-              f"配置文件里的 image_size 要按**实际值**填")
-    return cap
+# 目标角速度（来自实测：τ 分辨率 ≈ 角度残差 / 角速度）
+TARGET_GYRO_DPS = 90.0
+MIN_GYRO_DPS = 40.0
 
 
 class ImuCollector:
@@ -110,35 +105,55 @@ class ImuCollector:
         self._stop.set()
         self._t.join(timeout=1.0)
 
+    def recent_gyro_dps(self, n: int = 200) -> float:
+        """最近 n 帧的平均角速度模长（度/秒）—— 采集质量实时反馈。"""
+        import numpy as np
 
-def write_outputs(out: Path, frames, imu_frames, raw: bytes, cam_info: dict) -> None:
+        if len(self.frames) < 10:
+            return 0.0
+        g = np.array([f.gyro for f in self.frames[-n:]])
+        return float(np.rad2deg(np.linalg.norm(g, axis=1).mean()))
+
+
+def write_outputs(out: Path, imu_frames, raw: bytes, cam_info: dict,
+                  cam_ts_rows: list) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     if imu_frames:
         with (out / "imu.txt").open("w") as f:
             f.write(IMU_HEADER + "\n")
             for fr in imu_frames:
-                g = fr.six_axis()          # gx gy gz ax ay az
+                g = fr.six_axis()
                 f.write(f"{fr.t_host:.6f} " + " ".join(f"{v:.6f}" for v in g) + "\n")
 
         with (out / "imu_h7_full.csv").open("w") as f:
             f.write(FULL_HEADER + "\n")
             for fr in imu_frames:
                 v = fr.values
-                f.write(
-                    f"{fr.t_board_ms},{fr.t_host:.6f},"
-                    f"{v['gx']:.6f},{v['gy']:.6f},{v['gz']:.6f},"
-                    f"{v['ax']:.6f},{v['ay']:.6f},{v['az']:.6f},"
-                    f"{v['roll']:.6f},{v['pitch']:.6f},{v['yaw']:.6f},"
-                    f"{v['qw']:.6f},{v['qx']:.6f},{v['qy']:.6f},{v['qz']:.6f}\n"
-                )
+                f.write(f"{fr.t_board_ms},{fr.t_host:.6f},"
+                        f"{v['gx']:.6f},{v['gy']:.6f},{v['gz']:.6f},"
+                        f"{v['ax']:.6f},{v['ay']:.6f},{v['az']:.6f},"
+                        f"{v['roll']:.6f},{v['pitch']:.6f},{v['yaw']:.6f},"
+                        f"{v['qw']:.6f},{v['qx']:.6f},{v['qy']:.6f},{v['qz']:.6f}\n")
 
     if raw:
         (out / "imu_raw.bin").write_bytes(raw)
 
+    # image_timestamps.txt —— 标定程序读的就是这个（README 第 5.1 节格式）
+    if cam_ts_rows:
+        with (out / "image_timestamps.txt").open("w") as f:
+            f.write("# filename timestamp_seconds (host monotonic clock, unit: s)\n")
+            for r in cam_ts_rows:
+                f.write(f"{r['filename']} {r['host_ts']:.9f}\n")
+        with (out / "camera_timestamps.csv").open("w") as f:
+            f.write("frame,filename,host_monotonic_s,device_ts\n")
+            for r in cam_ts_rows:
+                f.write(f"{r['frame']},{r['filename']},{r['host_ts']:.9f},"
+                        f"{r['device_ts'] if r['device_ts'] is not None else ''}\n")
+
     meta = {
         "captured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "n_images": len(list((out / "images").glob("*.png"))) if (out / "images").exists() else 0,
+        "n_images": len(cam_ts_rows),
         "n_imu_frames": len(imu_frames),
         "imu_raw_bytes": len(raw),
         **cam_info,
@@ -146,8 +161,7 @@ def write_outputs(out: Path, frames, imu_frames, raw: bytes, cam_info: dict) -> 
     if imu_frames:
         meta["imu_check"] = validate(imu_frames)
     (out / "meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
-    )
+        json.dumps(meta, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     print(f"\n已写入 {out}/")
     print(f"  图像      {meta['n_images']} 张")
@@ -156,30 +170,33 @@ def write_outputs(out: Path, frames, imu_frames, raw: bytes, cam_info: dict) -> 
         st = meta["imu_check"]
         print(f"  采样率    {st['采样率_Hz']:.3f} Hz")
         print(f"  时间戳步长非1的帧数  {st['时间戳步长_非1帧数']}  (应为 0)")
-        print(f"  四元数vs欧拉角最大误差 {st['四元数vs欧拉角_最大误差_rad']:.2e} rad")
+    print(f"  设备时间戳：{'有（camera_timestamps.csv）' if cam_ts_rows and cam_ts_rows[0]['device_ts'] else '无'}")
+    print("\n下一步：")
+    print(f"  .venv/bin/python calib/run_calibration.py --session {out} \\")
+    print(f"      --pattern <内角点> --square-mm <方格毫米>")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Camera-IMU 数据集采集（UVC 相机 + H7 IMU）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    ap.add_argument("--out", required=True, help="输出目录，如 data/session_01")
+        description="Camera-IMU 数据集采集（工业 U3V 相机 / UVC + H7 IMU）",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", required=True)
     ap.add_argument("--serial", default="/dev/ttyACM0", help="IMU 串口")
     ap.add_argument("--baud", type=int, default=921600)
-    ap.add_argument("--camera", default="0", help="相机索引，或 none")
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--lock-exposure", action="store_true", help="尝试锁定自动曝光")
+    ap.add_argument("--camera-source", default="hik",
+                    help="hik=工业相机；0/1/...=UVC 索引；none=不接相机")
+    ap.add_argument("--width", type=int, default=1624)
+    ap.add_argument("--height", type=int, default=1240)
+    ap.add_argument("--pixel-format", default="Mono8")
+    ap.add_argument("--exposure", type=float, default=None, help="曝光，微秒")
+    ap.add_argument("--gain", type=float, default=None, help="增益，dB")
+    ap.add_argument("--frame-rate", type=float, default=10.0)
     ap.add_argument("--frames", type=int, default=0,
-                    help=">0 则进入无窗口自测：自动抓 N 帧后退出")
-    ap.add_argument("--frame-interval", type=float, default=0.3,
-                    help="无窗口模式下每帧间隔秒数")
-    ap.add_argument("--auto-interval", type=float, default=0.25,
-                    help="交互模式下自动连拍的间隔秒数")
-    ap.add_argument("--imu-only", action="store_true", help="只采 IMU，不需要相机")
-    ap.add_argument("--seconds", type=float, default=0.0,
-                    help="配合 --imu-only：采集时长（秒）")
+                    help=">0 进入无窗口自测：自动抓 N 帧后退出")
+    ap.add_argument("--frame-interval", type=float, default=0.2)
+    ap.add_argument("--auto-interval", type=float, default=0.25)
+    ap.add_argument("--imu-only", action="store_true")
+    ap.add_argument("--seconds", type=float, default=0.0)
     args = ap.parse_args()
 
     out = Path(args.out).expanduser()
@@ -197,87 +214,86 @@ def main() -> int:
     imu.start()
     collector = ImuCollector(imu)
     collector.start()
-
-    # 等第一批帧，确认协议对得上
     time.sleep(0.4)
     if imu.n_frames == 0:
-        print("❌ 串口打开成功但收不到数据。确认：设备是否在发送？波特率/线是否正确？")
-        print("   排查工具：python3 calib/imu_h7.py --port <串口>")
+        print("❌ 串口打开成功但收不到数据。排查：python3 calib/imu_h7.py --port <串口>")
         collector.stop(); imu.close()
         return 2
     print(f"IMU 已在收数据（{imu.n_frames} 帧 / {imu.n_bytes} 字节）")
 
-    # ── 只采 IMU ───────────────────────────────────────────
     if args.imu_only:
         secs = args.seconds if args.seconds > 0 else 5.0
         print(f"IMU-only 模式，采集 {secs} 秒 ...")
         time.sleep(secs)
         collector.stop(); imu.close()
-        write_outputs(out, [], collector.frames, bytes(imu.raw), {"camera": "none"})
+        write_outputs(out, collector.frames, bytes(imu.raw), {"camera": "none"}, [])
         return 0
 
     # ── 相机 ───────────────────────────────────────────────
-    cam_info = {"camera": args.camera}
+    cam_info = {"camera_source": args.camera_source}
     cap = None
-    if args.camera.lower() != "none":
+    if args.camera_source.lower() != "none":
         try:
-            cap = open_camera(int(args.camera), args.width, args.height,
-                              args.lock_exposure)
-            cam_info.update(
-                camera_width=int(cap.get(3)), camera_height=int(cap.get(4)),
-                camera_fps=float(cap.get(5)),
-            )
+            cap = open_camera(args.camera_source)
+            cap.configure(width=args.width, height=args.height,
+                          pixel_format=args.pixel_format,
+                          exposure_us=args.exposure, gain_db=args.gain,
+                          frame_rate=args.frame_rate)
+            cam_info.update(cap.info())
+            print(f"相机已打开：{cam_info.get('model', cam_info.get('kind'))} "
+                  f"{cam_info.get('width')}x{cam_info.get('height')} "
+                  f"{cam_info.get('pixel_format', '')}")
         except Exception as e:  # noqa: BLE001
             print(f"❌ {e}")
-            print("   可以先用 --camera none 只采 IMU，或先用笔记本摄像头跑通流程。")
+            print("   可先用 --camera-source none 只采 IMU，或用 --camera-source 0 走 UVC。")
             collector.stop(); imu.close()
             return 2
 
-    ts_lines: list[str] = []
+    cam_ts_rows: list[dict] = []
+    frame_iter = cap.frames(None) if cap is not None else None
     idx = 0
 
-    def save_frame(frame) -> None:
+    def save_one(frame) -> None:
         nonlocal idx
         import cv2
-        t = time.monotonic()          # 紧跟 read() 之后取时刻，越早越准
+
         name = f"{idx:06d}.png"
-        cv2.imwrite(str(out / "images" / name), frame)
-        ts_lines.append(f"{name} {t:.9f}")
+        cv2.imwrite(str(out / "images" / name), frame.image)
+        cam_ts_rows.append({"frame": idx, "filename": name,
+                            "host_ts": frame.host_ts, "device_ts": frame.device_ts})
         idx += 1
 
     try:
         if args.frames > 0:
-            # 无窗口自测
             print(f"无窗口模式：抓 {args.frames} 帧 ...")
             for _ in range(args.frames):
-                ok, frame = cap.read()
-                if not ok:
-                    print("❌ 读帧失败")
-                    break
-                save_frame(frame)
+                save_one(next(frame_iter))
                 time.sleep(args.frame_interval)
         else:
             import cv2
             print("\n交互模式：s=存一帧  a=自动连拍  q=结束")
+            print(f"采集要点：开头静置 3 秒 → 绕三轴快速转动"
+                  f"（目标 ≥{TARGET_GYRO_DPS:.0f}°/s）→ 小幅平移 → 板走遍画面")
             auto = False
             last_auto = 0.0
             while True:
-                ok, frame = cap.read()
-                if not ok:
-                    print("❌ 读帧失败，退出")
-                    break
+                f = next(frame_iter)
                 now = time.monotonic()
                 if auto and now - last_auto >= args.auto_interval:
-                    save_frame(frame)
-                    last_auto = now
-                disp = frame.copy()
-                cv2.putText(disp, f"saved={idx} auto={'ON' if auto else 'off'}",
-                            (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 0) if auto else (0, 200, 255), 2)
+                    save_one(f); last_auto = now
+                disp = cv2.cvtColor(f.image, cv2.COLOR_GRAY2BGR) \
+                    if f.image.ndim == 2 else f.image.copy()
+                gdps = collector.recent_gyro_dps()
+                warn = bool(idx > 3 and gdps < MIN_GYRO_DPS)
+                txt = (f"saved={idx} auto={'ON' if auto else 'off'}  "
+                       f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f})"
+                       + ("  TOO SLOW!" if warn else ""))
+                cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                            (0, 0, 255) if warn else (0, 220, 0), 2)
                 cv2.imshow("capture (s save / a auto / q quit)", disp)
                 k = cv2.waitKey(1) & 0xFF
                 if k == ord("s"):
-                    save_frame(frame)
+                    save_one(f)
                 elif k == ord("a"):
                     auto = not auto
                     print(f"自动连拍 {'开' if auto else '关'}")
@@ -286,15 +302,11 @@ def main() -> int:
             cv2.destroyAllWindows()
     finally:
         if cap is not None:
-            cap.release()
+            cap.close()
         collector.stop()
         imu.close()
 
-    with (out / "image_timestamps.txt").open("w") as f:
-        f.write("# filename timestamp_seconds (monotonic clock, unit: s)\n")
-        f.write("\n".join(ts_lines) + ("\n" if ts_lines else ""))
-
-    write_outputs(out, [], collector.frames, bytes(imu.raw), cam_info)
+    write_outputs(out, collector.frames, bytes(imu.raw), cam_info, cam_ts_rows)
     return 0
 
 
