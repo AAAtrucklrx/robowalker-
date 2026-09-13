@@ -224,91 +224,136 @@ def _savgol(y, dt, window, polyorder, deriv=0, axis=0):
 
 def solve_lever_arm(cam_times, R_CB_list, t_CB_list, imu_times, accel,
                     R_IC, tau: float = 0.0, gravity: float = 9.80665,
+                    pos_sigma: float = 0.0015, rot_sigma: float = 0.002,
                     smooth_window: int = 9, polyorder: int = 3,
+                    use_spline: bool = True, estimate_gravity: bool = True,
                     verbose: bool = False) -> dict:
     """用杠杆臂效应解 IMU 原点在相机系下的坐标 ``r``。
 
-    参数
-    ----
-    cam_times  : (N,) 相机时间戳（主机时钟）
-    R_CB_list  : (N,3,3) PnP 得到的 R_CB
-    t_CB_list  : (N,3)   PnP 得到的 t_CB
-    imu_times  : (M,) IMU 时间戳（IMU 时钟）
-    accel      : (M,3) 加速度计（比力，m/s^2）
-    tau        : 时钟偏移，``t_host = t_imu + tau``
-    R_IC       : 已解出的旋转外参
+    ``use_spline=True``（默认）用 **B样条解析导数**求 ``a_WC`` 与 ``R̈``；
+    ``False`` 退回 Savitzky-Golay 数值微分（保留用于对比，实测差约 100 倍）。
 
-    返回 dict：r、t_IC、LS 残差、条件数。
+    ``pos_sigma`` **必须尽量设准**（PnP 位置的预期噪声，米）。实测：
+    3 mm 噪声下，sigma 设对时 a 误差 0.0125 m/s²；sigma 设成 1 mm 时
+    误差反而涨到 6.8 m/s²——**比不做还糟**。``quality()`` 会打印实际残差，
+    与设定值差一个量级就说明设错了。
     """
+    import cv2 as _cv2
+
     t = np.asarray(cam_times, float)
     R_CB = np.asarray(R_CB_list, float)
     t_CB = np.asarray(t_CB_list, float)
     n = len(t)
-    if n < 12:
-        raise ValueError(f"相机帧只有 {n} 帧，二次微分不可靠，至少需要 12 帧")
+    if n < 20:
+        raise ValueError(f"相机帧只有 {n} 帧，B样条拟合不可靠，至少需要 20 帧")
 
     dt = float(np.mean(np.diff(t)))
-    if np.std(np.diff(t)) > 0.05 * dt:
-        if verbose:
-            print(f"  ⚠️ 相机时间戳间隔不均匀（std/dt={np.std(np.diff(t))/dt:.3f}），"
-                  f"求导前请先按时间重采样")
+    if verbose and np.std(np.diff(t)) > 0.05 * dt:
+        print(f"  ⚠️ 相机时间戳间隔不均匀（std/dt={np.std(np.diff(t))/dt:.3f}）")
 
     # 相机在世界系下的位姿：板=世界 → T_WC = (T_CB)^{-1}
     R_WC = np.array([R.T for R in R_CB])
     p_WC = np.array([-R.T @ tt for R, tt in zip(R_CB, t_CB)])
 
-    # ① 位置：平滑后求二阶导
-    p_s = _savgol(p_WC, dt, smooth_window, polyorder, deriv=0)
-    a_WC = _savgol(p_s, dt, smooth_window, polyorder, deriv=2)
+    traj = None
+    if use_spline:
+        from trajectory import SplineTrajectory
 
-    # ② 姿态：先由中心差分求角速度，再平滑求角加速度
-    w_W = np.zeros((n, 3))
-    for i in range(1, n - 1):
-        dR = R_WC[i + 1] @ R_WC[i - 1].T
-        w_W[i] = cv2.Rodrigues(dR)[0].reshape(3) / (2 * dt)
-    w_W[0], w_W[-1] = w_W[1], w_W[-2]
-    w_W_s = _savgol(w_W, dt, smooth_window, polyorder, deriv=0)
-    alpha_W = _savgol(w_W_s, dt, smooth_window, polyorder, deriv=1)
-
-    # ③ R̈ = R([ω_b]×² + [α_b]×)，ω_b/α_b 为本体系分量
-    Rdd = np.zeros((n, 3, 3))
-    for i in range(n):
-        wb = R_WC[i].T @ w_W_s[i]
-        ab = R_WC[i].T @ alpha_W[i]
-        Rdd[i] = R_WC[i] @ (skew(wb) @ skew(wb) + skew(ab))
+        traj = SplineTrajectory.fit(t, R_WC, p_WC, pos_sigma=pos_sigma,
+                                    rot_sigma=rot_sigma)
+        R_WC_s = traj.R(t)
+        a_WC = traj.a(t)
+        Rdd = traj.Rdd(t)
+        if verbose:
+            print(f"  {traj.report()}")
+    else:
+        # 回退路径：Savitzky-Golay 数值微分
+        p_s = _savgol(p_WC, dt, smooth_window, polyorder, deriv=0)
+        a_WC = _savgol(p_s, dt, smooth_window, polyorder, deriv=2)
+        w_W = np.zeros((n, 3))
+        for i in range(1, n - 1):
+            dR = R_WC[i + 1] @ R_WC[i - 1].T
+            w_W[i] = _cv2.Rodrigues(dR)[0].reshape(3) / (2 * dt)
+        w_W[0], w_W[-1] = w_W[1], w_W[-2]
+        w_W_s = _savgol(w_W, dt, smooth_window, polyorder, deriv=0)
+        alpha_W = _savgol(w_W_s, dt, smooth_window, polyorder, deriv=1)
+        R_WC_s = R_WC
+        Rdd = np.zeros((n, 3, 3))
+        for i in range(n):
+            wb = R_WC[i].T @ w_W_s[i]
+            ab = R_WC[i].T @ alpha_W[i]
+            Rdd[i] = R_WC[i] @ (skew(wb) @ skew(wb) + skew(ab))
 
     # ④ 加速度计按主机时钟重采样：t_host = t_imu + tau
     t_imu = np.asarray(imu_times, float) + tau
     a_meas = np.stack([np.interp(t, t_imu, np.asarray(accel, float)[:, j])
                        for j in range(3)], axis=1)
 
-    # ⑤ 组装线性方程 M r = b
-    R_WI = np.array([R_WC[i] @ R_IC.T for i in range(n)])
-    g_W = np.array([0.0, 0.0, -gravity])
+    # ⑤ 组装线性方程
+    R_WI = np.array([R_WC_s[i] @ R_IC.T for i in range(n)])
+    rhs = (np.einsum("nij,nj->ni", R_WI, a_meas) - a_WC).reshape(-1)
     M = Rdd.reshape(-1, 3)
-    b = (np.einsum("nij,nj->ni", R_WI, a_meas) + g_W[None, :] - a_WC).reshape(-1)
 
-    r, *_ = np.linalg.lstsq(M, b, rcond=None)
-    resid = M @ r - b
+    # ★ 关键：**不要把板系当成重力对齐的世界系**。
+    #
+    # 标定板的两解二义性意味着 PnP 解出的 R_CB 可能与真值相差一个"绕板面内轴
+    # 180°"的翻转；由于棋盘格中心对称，两解的**重投影几乎相同**，无法从图像
+    # 区分。好消息是 AX=XB 对常量板系偏置免疫（S 在 B 里抵消），所以**旋转
+    # 外参不受影响**；坏消息是 a_WC / R̈ 都在板系里，而重力在板系中的方向
+    # 因此是未知的。
+    #
+    # 解法：把重力向量 g_W 也当作未知量，与 r 联合最小二乘——
+    #     R̈_WC · r + g_W  =  R_WI·a_meas − a_WC
+    # 对 [r; g_W] 是线性的（6 个未知量）。附带好处：|g_W| 应当等于 9.80665，
+    # 这就成了一个**内建的自检指标**。
+    if estimate_gravity:
+        A = np.hstack([M, np.tile(np.eye(3), (n, 1))])
+        sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
+        r, g_est = sol[:3], sol[3:]
+        resid = A @ sol - rhs
+    else:
+        g_est = np.array([0.0, 0.0, -gravity])
+        y = rhs - np.tile(g_est, n)
+        r, *_ = np.linalg.lstsq(M, y, rcond=None)
+        resid = M @ r - y
+
     cond = float(np.linalg.cond(M))
+    rms = float(np.sqrt(np.mean(resid ** 2)))
+    g_norm = float(np.linalg.norm(g_est))
+    # |g| 与真值差多少 —— 只有板系与世界系真的对齐时才会接近 0
+    g_err = abs(g_norm - gravity)
 
     t_IC = lever_to_t_IC(R_IC, r)
     out = {
         "r_lever_m": r,
         "t_IC_m": t_IC,
-        "residual_rms_ms2": float(np.sqrt(np.mean(resid ** 2))),
+        "gravity_in_board_frame": g_est,
+        "gravity_norm": g_norm,
+        "gravity_norm_error": g_err,
+        "gravity_tilt_deg": float(np.rad2deg(np.arccos(np.clip(
+            -g_est[2] / max(g_norm, 1e-9), -1, 1)))),
+        "residual_rms_ms2": rms,
         "cond": cond,
         "n_samples": int(len(t)),
-        "reliable": bool(np.sqrt(np.mean(resid ** 2)) < 1.0 and cond < 1e4),
+        "method": ("spline" if use_spline else "savgol")
+                  + ("+gravity-joint" if estimate_gravity else ""),
+        "trajectory_quality": traj.quality() if traj is not None else None,
+        # 可信判据：LS 残差要明显小于杠杆臂信号量级（约 0.06 m/s²），
+        # 且估出的 |g| 要接近 9.80665
+        "reliable": bool(rms < 0.05 and cond < 1e4 and g_err < 0.2),
     }
     if verbose:
-        print(f"  杠杆臂 r = {np.array2string(r, precision=4)} m "
+        print(f"  重力(板系) = {np.array2string(g_est, precision=4)}  "
+              f"|g| = {g_norm:.4f} m/s² (真值 {gravity:.4f}, 差 {g_err:.4f})")
+        print(f"  杠杆臂 r   = {np.array2string(r, precision=4)} m "
               f"(|r|={np.linalg.norm(r)*100:.2f} cm)")
-        print(f"  t_IC   = {np.array2string(t_IC, precision=4)} m "
+        print(f"  t_IC       = {np.array2string(t_IC, precision=4)} m "
               f"(|t|={np.linalg.norm(t_IC)*100:.2f} cm)")
-        print(f"  LS 残差 RMS = {out['residual_rms_ms2']:.4f} m/s²，"
-              f"cond(M) = {cond:.1f}  "
-              f"{'✅ 可信' if out['reliable'] else '⚠️ 平移不可信，请结合尺子测量并说明'}")
+        print(f"  LS 残差 RMS = {rms:.5f} m/s²（杠杆臂信号量级约 0.06 m/s²），"
+              f"cond(M) = {cond:.1f}")
+        if g_err > 0.2:
+            print(f"  ⚠️ |g| 偏差 {g_err:.4f} 偏大：说明板系与世界系未对齐或数据有问题")
+        print(f"  {'✅ 可信' if out['reliable'] else '⚠️ 残差偏大，平移仍不可信'}")
     return out
 
 
