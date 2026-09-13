@@ -217,8 +217,12 @@ def main() -> int:
         make_chessboard(args.cols, args.rows, args.square_mm, out, png,
                         dpi=args.dpi, with_ruler=args.with_ruler)
     else:
-        if args.cols % 2 == 0 or args.rows % 2 == 0:
-            print("⚠️  ChArUco 建议方格数为奇数 x 偶数（如 11x8），检测更稳")
+        # 建议"奇数 x 偶数"（如 11x8）。注意 9x6 就是奇x偶，是**推荐**配置，
+        # 不能写成 "cols 偶数 或 rows 偶数" —— 那样会把 9x6 也误报掉。
+        if args.cols % 2 == args.rows % 2:
+            print(f"⚠️  ChArUco 建议方格数为「奇数 x 偶数」（如 11x8）；"
+                  f"当前 {args.cols}x{args.rows} 是"
+                  f"{'偶x偶' if args.cols % 2 == 0 else '奇x奇'}，角点检测稳定性略差")
         make_charuco(args.cols, args.rows, args.square_mm, args.marker_ratio,
                      out, png, dpi=max(args.dpi, 600), dict_name=args.dict,
                      with_ruler=args.with_ruler)
