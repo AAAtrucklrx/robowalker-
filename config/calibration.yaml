@@ -1,0 +1,86 @@
+# Camera-IMU 联合标定 —— 配置文件
+# 所有可调参数放这里，核心代码不硬编码（任务文档第 5 节要求）。
+# 路径支持 ~ 展开；相对路径按项目根目录解析。
+
+# ── 数据源：图像序列 + IMU 记录 ──────────────────────────────
+data:
+  # 图像目录：里面是 000000.png / 000001.png ... 按名字排序即为时间顺序
+  image_dir: data/session_01/images
+  # 时间戳文件：每行 "<图像文件名> <时间戳秒>"，见下方 timestamp_format
+  image_timestamps: data/session_01/image_timestamps.txt
+  # IMU 记录：列顺序由 imu_columns 指定，分隔符由 imu_delimiter 指定
+  imu_file: data/session_01/imu.txt
+  imu_delimiter: " "
+  imu_columns: [timestamp, gx, gy, gz, ax, ay, az]   # 时间戳单位: 秒；角速度 rad/s；加速度 m/s^2
+
+# ── 时间系统 ────────────────────────────────────────────────
+time:
+  unit: s              # s | ms | us | ns —— 输入文件里时间戳的单位，程序内部统一换算成秒
+  clock: monotonic     # monotonic | system —— 采集时用哪种时钟，决定跨设备对齐是否可靠
+
+# ── 标定板 ──────────────────────────────────────────────────
+target:
+  type: chessboard     # chessboard | aruco | apriltag
+  # 棋盘格：内角点数量（列 x 行），不是方格数量
+  chessboard:
+    pattern_size: [9, 6]
+    square_size: 0.025      # 单位：米。必须与实际打印尺寸一致，否则平移外参尺度错误
+  # ArUco/AprilTag 备用配置（切 type 时生效）
+  aruco:
+    dict: DICT_4X4_50
+    marker_size: 0.05
+    marker_ids: [0, 1, 2, 3]
+
+# ── 相机模型与内参标定 ──────────────────────────────────────
+camera:
+  model: pinhole            # pinhole | fisheye
+  image_size: [640, 480]    # 采集分辨率，必须与图像文件一致
+  # 内参标定开关：true 则先用棋盘格标内参，false 则直接读 initial_intrinsics
+  calibrate_intrinsics: true
+  initial_intrinsics:       # 仅在 calibrate_intrinsics=false 或作为初值时使用
+    fx: 600.0
+    fy: 600.0
+    cx: 320.0
+    cy: 240.0
+    dist: [0.0, 0.0, 0.0, 0.0, 0.0]   # k1 k2 p1 p2 k3
+  # 采集相机数据时图像里若含标定板请保持 true
+  estimate_pose_from_target: true
+
+# ── IMU 相关阈值 ────────────────────────────────────────────
+imu:
+  gyro_noise_density: 0.005      # rad/s/√Hz，查 IMU 手册；缺省值仅用于占位
+  accel_noise_density: 0.05      # m/s^2/√Hz
+  gyro_random_walk: 1.0e-5
+  accel_random_walk: 1.0e-4
+  # 静止检测：用于零偏标定与初始姿态对齐
+  static:
+    accel_std_max: 0.05          # 加速度标准差上限 m/s^2
+    gyro_std_max: 0.02           # 角速度标准差上限 rad/s
+    min_duration: 1.0            # 静止段最短时长 s
+  gravity: 9.81                  # 依据实测地重力加速度可改
+
+# ── 外参标定 ────────────────────────────────────────────────
+extrinsic:
+  method: hand_eye             # hand_eye | motion_correlation | manual_seed
+  # 手眼标定的经典形式：AX = XB，X 即 T_IC（IMU 系 → 相机系的位姿取逆，见 README 坐标系章节）
+  convention: T_IC_means_camera_to_imu   # 必须与 README 中的定义一字不差
+  min_motion_samples: 20
+  # 平移外参的可观测性检查：纯旋转激励无法确定平移
+  require_translation_excitation: true
+
+# ── 输出 ────────────────────────────────────────────────────
+output:
+  dir: results
+  yaml_name: calibration_result.yaml
+  json_name: calibration_result.json
+  # 每次标定落盘一份带时间戳的快照，便于"多次独立标定结果对比"这类验证
+  keep_snapshots: true
+  report_dir: results/report
+
+# ── 验证 ────────────────────────────────────────────────────
+validation:
+  # 任务文档第 4 节要求至少一种验证，这里默认全开
+  compute_reprojection_error: true
+  compute_calibration_residual: true
+  compute_motion_consistency: true
+  cross_validate_splits: 3      # 把数据切 N 份做交叉标定，用于"多次独立标定对比"

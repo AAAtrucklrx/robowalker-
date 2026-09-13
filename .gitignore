@@ -1,0 +1,7 @@
+.venv/
+.bootstrap/
+pip.pyz
+__pycache__/
+*.pyc
+data/
+results/
