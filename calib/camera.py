@@ -50,8 +50,10 @@ UVC 分支只需要 OpenCV。
 from __future__ import annotations
 
 import gc
+import os
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
 
 import numpy as np
@@ -117,6 +119,82 @@ def list_devices() -> list[dict]:
     return out
 
 
+# ══════════════════════════════════════════════════════════════
+#  USB 假死自愈
+# ══════════════════════════════════════════════════════════════
+# 2026-09-14 实测确认的规律（这是本模块最值得记住的一条）：
+#
+#   连续 5 次「打开→配置→取帧→**正常 close()**」循环 → 全部成功；
+#   只要有一次**不干净释放**（进程被强杀 / SIGABRT / 忘了 close）
+#   → 下一次就在 ``set_pixel_format_from_string`` 报
+#     ``[PixelFormat_Reg] USB3Vision write_memory error``，
+#     之后永远 ``LIBUSB_ERROR_BUSY``，所有取景工具都是**黑屏**。
+#
+# 也就是说"相机黑屏"九成不是相机坏了，而是上一次没干净退出。
+# 好消息是：``/dev/bus/usb/...`` 在本机是 777，一次 ``USBDEVFS_RESET``
+# ioctl 就能救回来，**不需要 root、不需要拔插**。
+#
+# 所以这里把"检测到假死 → 自动复位 → 重试"内建到相机层，
+# 而不是要求每个调用方都记得先跑 reset 工具。
+_USB_WEDGE_SIGNS = (
+    "write_memory error", "LIBUSB_ERROR_BUSY", "PixelFormat_Reg",
+    "Failed to claim USB control interface",
+)
+_USB_VENDOR, _USB_PRODUCT = "2bdf", "0001"   # Hikrobot U3V
+USBDEVFS_RESET = 0x5514                       # _IO('U', 20)
+
+
+def is_usb_wedge(exc: BaseException) -> bool:
+    """这个异常是不是"USB 假死"（而不是真的参数错误/设备不存在）。"""
+    s = str(exc)
+    return any(k in s for k in _USB_WEDGE_SIGNS)
+
+
+def usb_reset_camera(vendor: str = _USB_VENDOR, product: str = _USB_PRODUCT,
+                     settle_s: float = 2.5) -> bool:
+    """对相机做一次 USB 复位。成功返回 True。
+
+    为什么扫 sysfs 而不是记着旧路径：**复位后设备号会变**（003 → 006 之类），
+    写死路径第二次就失效。
+    """
+    import fcntl
+
+    def _nodes():
+        found = []
+        for d in Path("/sys/bus/usb/devices").glob("*"):
+            try:
+                if (d / "idVendor").read_text().strip().lower() != vendor.lower():
+                    continue
+                if (d / "idProduct").read_text().strip().lower() != product.lower():
+                    continue
+                found.append((int((d / "busnum").read_text()),
+                              int((d / "devnum").read_text())))
+            except (OSError, ValueError):
+                continue
+        return found
+
+    nodes = _nodes()
+    if not nodes:
+        return False
+    done = False
+    for bus, dev in nodes:
+        node = f"/dev/bus/usb/{bus:03d}/{dev:03d}"
+        try:
+            fd = os.open(node, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+            done = True
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    if done:
+        time.sleep(settle_s)          # 等重新枚举完成
+    return done
+
+
 class HikCamera:
     """USB3 Vision / GigE 工业相机。接口与 :class:`UvcCamera` 一致。"""
 
@@ -125,16 +203,35 @@ class HikCamera:
     def __init__(self, device_index: int = 0, device_id: str | None = None):
         self.Aravis = _import_aravis()
         A = self.Aravis
-        A.update_device_list()
-        if A.get_n_devices() == 0:
-            raise RuntimeError("aravis 没发现任何相机。检查：lsusb | grep 2bdf；"
-                               "确认相机插在 USB3 口上（lsusb -t 应显示 5000M）")
-        self.device_id = device_id or A.get_device_id(device_index)
-        self.cam = A.Camera.new(self.device_id)
         self.stream = None
         self._n_buffers = 0
         self._payload = 0
         self._ring: list = []          # 待回收的 buffer，避免频繁分配
+
+        # 打开设备：遇到 USB 假死就自动复位并重试（见本模块顶部说明）。
+        last_exc: BaseException | None = None
+        for attempt in range(3):
+            A.update_device_list()
+            if A.get_n_devices() == 0:
+                raise RuntimeError(
+                    "aravis 没发现任何相机。检查：lsusb | grep 2bdf；"
+                    "确认相机插在 USB3 口上（lsusb -t 应显示 5000M）")
+            self.device_id = device_id or A.get_device_id(device_index)
+            try:
+                self.cam = A.Camera.new(self.device_id)
+                break
+            except Exception as e:                 # noqa: BLE001
+                last_exc = e
+                if attempt < 2 and is_usb_wedge(e):
+                    print(f"  ⚠️  打开相机失败（USB 假死），自动复位后重试 "
+                          f"({attempt+1}/2) ...")
+                    usb_reset_camera()
+                    time.sleep(1.0)
+                    continue
+                raise
+        else:                                      # pragma: no cover
+            raise last_exc if last_exc else RuntimeError("打开相机失败")
+
         # 时间戳换算基准：aravis 的 system timestamp 是墙钟(ns)，换成单调钟
         self._mono0 = time.monotonic()
         self._wall0 = time.time()
@@ -229,17 +326,10 @@ class HikCamera:
         return d
 
     # -- 配置 --------------------------------------------------
-    def configure(self, width=None, height=None, pixel_format="Mono8",
-                  exposure_us=None, exposure_auto=False, gain_db=None,
-                  frame_rate=None, n_buffers=8):
-        """设置采集参数。所有项都是可选的，只改传进来的。"""
-        A, c = self.Aravis, self.cam
-
-        # 改分辨率/像素格式前必须先停流，否则会报错
-        if self.stream is not None:
-            self.close()
-            self.cam = A.Camera.new(self.device_id)
-
+    def _apply_config(self, c, width, height, pixel_format, exposure_us,
+                      exposure_auto, gain_db, frame_rate, n_buffers):
+        """把参数写进相机对象 ``c``（不含打开/关闭，便于外面套重试）。"""
+        A = self.Aravis
         if pixel_format:
             avail = list(c.dup_available_pixel_formats_as_strings())
             if pixel_format not in avail:
@@ -270,6 +360,42 @@ class HikCamera:
         self.stream = c.create_stream(None, None, n_buffers)
         for _ in range(n_buffers):
             self.stream.push_buffer(A.Buffer.new_allocate(self._payload))
+
+    def configure(self, width=None, height=None, pixel_format="Mono8",
+                  exposure_us=None, exposure_auto=False, gain_db=None,
+                  frame_rate=None, n_buffers=8):
+        """设置采集参数。所有项都是可选的，只改传进来的。
+
+        遇到 **USB 假死**会自动复位设备并重试一次 —— 这样所有调用方
+        （取景 / 采集 / 参数工具）都不必自己处理这个坑。
+        """
+        A = self.Aravis
+
+        # 改分辨率/像素格式前必须先停流，否则会报错
+        if self.stream is not None:
+            self.close()
+            self.cam = A.Camera.new(self.device_id)
+
+        args = (width, height, pixel_format, exposure_us, exposure_auto,
+                gain_db, frame_rate, n_buffers)
+        for attempt in range(2):
+            try:
+                # ⚠️ 注意：``self.cam`` 可能已被上面的 close()+Camera.new 换掉，
+                # 所以这里**必须重新取**，不能用函数开头缓存的引用。
+                # （原实现先取 `c = self.cam` 再 close/reopen，后续写的还是
+                #   旧的、已经释放掉的那个相机对象 —— 是个潜伏的真 bug。）
+                self._apply_config(self.cam, *args)
+                return self
+            except Exception as e:                 # noqa: BLE001
+                if attempt == 0 and is_usb_wedge(e):
+                    print(f"  ⚠️  相机配置失败（USB 假死），自动复位后重试 ...")
+                    self.close()
+                    usb_reset_camera()
+                    # 复位后设备号可能变了，重新按 device_id 打开
+                    self.Aravis.update_device_list()
+                    self.cam = A.Camera.new(self.device_id)
+                    continue
+                raise
         return self
 
     # -- 取流 --------------------------------------------------
@@ -278,21 +404,79 @@ class HikCamera:
             self.configure()
         self.cam.start_acquisition()
 
+    def set_exposure(self, exposure_us=None, gain_db=None):
+        """在**不停流**的前提下改曝光/增益 —— 实时取景时要一边看一边调。
+
+        为什么不复用 :meth:`configure`：它为了改分辨率会 ``close()`` 再
+        ``Camera.new()`` 重建整条流，调用一次要几百毫秒且会丢若干帧。
+        只改曝光/增益时相机本来就允许在线设置（前提是 auto 已关，这正是
+        ``configure`` 里做的事），所以直接写寄存器即可。
+        """
+        A, c = self.Aravis, self.cam
+        if exposure_us is not None:
+            c.set_exposure_time_auto(A.Auto.OFF)
+            c.set_exposure_time(float(exposure_us))
+        if gain_db is not None:
+            c.set_gain_auto(A.Auto.OFF)
+            c.set_gain(float(gain_db))
+        return self
+
+    def read_exposure(self) -> tuple[float | None, float | None]:
+        """读回当前曝光(µs)/增益(dB)，读不到就返回 None。
+
+        注意方法名是 ``get_exposure_time_auto`` / ``get_gain_auto`` ——
+        **没有** ``is_*_auto`` 这种写法（那是 C API 的风格）。之前写成
+        ``is_exposure_time_auto()`` 会抛 AttributeError，被这里的 except 吞掉，
+        于是永远返回 ``(None, None)``，看起来像"读不出来"，其实是名字写错了。
+        """
+        A, c = self.Aravis, self.cam
+        exp = gain = None
+        try:
+            if c.get_exposure_time_auto() == A.Auto.OFF:
+                exp = float(c.get_exposure_time())
+        except Exception:                                   # noqa: BLE001
+            pass
+        try:
+            if c.get_gain_auto() == A.Auto.OFF:
+                gain = float(c.get_gain())
+        except Exception:                                   # noqa: BLE001
+            pass
+        return exp, gain
+
     def stop(self):
         if self.stream is not None:
             self.cam.stop_acquisition()
 
     def _decode(self, buf) -> np.ndarray:
+        """把 aravis buffer 解成 numpy 图。
+
+        ⚠️ **必须 ``copy()`` —— 这里曾经是一个 use-after-free**
+        ------------------------------------------------------------------
+        ``np.frombuffer(...)`` 是**零拷贝**的：它造出的数组只是**引用**
+        ``buf.get_data()`` 指向的内存，而那块内存属于 aravis 的 ``buf`` 对象。
+        ``frames()`` 每轮都新建 buffer 并且不回收旧的，所以 ``buf`` 在下一轮
+        就被 GC 掉、内存随之释放 —— 于是 ``Frame.image`` 变成**悬垂指针**。
+
+        实测症状（2026-09-14）：实时取景跑十几秒后直接
+        ``corrupted size vs. prev_size`` + SIGABRT，**Python 侧连异常都拿不到**
+        （堆损坏发生在 libaravis/glib 内部）。更糟的是它**不一定马上发作** ——
+        单独测一帧时数据看着完全正确，只在内存被复用时才崩。这种"偶尔崩、
+        多数时候对"的 bug 最难查，而且它就在**采集主路径**上。
+
+        实测证据：``image.flags['OWNDATA'] is False``（不拥有内存）。
+        加上 ``copy()`` 后变为 True，连续运行数分钟不再崩。
+
+        代价：1624x1240 一帧 2 MB，10 Hz 也就 20 MB/s 的拷贝，完全可接受 ——
+        用这点带宽换内存安全是明显划算的。
+        """
         w, h = buf.get_image_width(), buf.get_image_height()
-        raw = np.frombuffer(buf.get_data(), dtype=np.uint8)
         pf = self.cam.get_pixel_format_as_string()
-        if pf in _MONO_FORMATS:
-            return raw[: w * h].reshape(h, w)
-        if pf in _BAYER_FORMATS:
-            return raw[: w * h].reshape(h, w)
-        if pf in _RGB_FORMATS or pf in _BGR_FORMATS:
-            return raw[: w * h * 3].reshape(h, w, 3)
-        return raw[: w * h].reshape(h, w)
+        n_ch = 3 if (pf in _RGB_FORMATS or pf in _BGR_FORMATS) else 1
+        need = int(w) * int(h) * n_ch
+        # count=need 同时防住"buffer 比预期短"的情况
+        raw = np.frombuffer(buf.get_data(), dtype=np.uint8, count=need)
+        shape = (h, w, 3) if n_ch == 3 else (h, w)
+        return np.array(raw.reshape(shape), copy=True, order="C")
 
     def frames(self, n: int | None = None, timeout_us: int = 2_000_000
                ) -> Iterator[Frame]:
@@ -409,6 +593,21 @@ class UvcCamera:
 
     def stop(self):
         pass
+
+    def set_exposure(self, exposure_us=None, gain_db=None):
+        """UVC 侧同样支持在线调曝光（V4L2 语义见 :meth:`configure`）。"""
+        if exposure_us is not None:
+            self.cap.set(self.cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+            self.cap.set(self.cv2.CAP_PROP_EXPOSURE, float(exposure_us))
+        if gain_db is not None:
+            self.cap.set(self.cv2.CAP_PROP_GAIN, float(gain_db))
+        return self
+
+    def read_exposure(self) -> tuple[float | None, float | None]:
+        exp = self.cap.get(self.cv2.CAP_PROP_EXPOSURE)
+        gain = self.cap.get(self.cv2.CAP_PROP_GAIN)
+        return (float(exp) if exp and exp > 0 else None,
+                float(gain) if gain and gain > 0 else None)
 
     def frames(self, n=None, timeout_us=2_000_000) -> Iterator[Frame]:
         k = 0
