@@ -398,11 +398,23 @@ def rot_angle(R: np.ndarray) -> float:
 
 
 def draw_detection(gray: np.ndarray, det: Detection, spec: BoardSpec) -> np.ndarray:
-    """画检测结果，用于肉眼确认（写报告插图也用它）。"""
+    """画检测结果，用于肉眼确认（写报告插图也用它）。
+
+    ⚠️ **必须按下标点个数保护**：``cv2.drawChessboardCorners`` 在点数少于
+    ``patternSize`` 时**不报错**，而是直接**越界读内存**（实测：传 80 个点、
+    patternSize=11x8 时会「成功返回」，画出来的是垃圾）。这会引发
+    glibc 堆损坏 —— 本项目已经因为堆问题崩过好几次，所以这种"静默越界"
+    的调用点必须一律加长度检查，宁可少画一张图。
+    同时统一转成 ``float32``：``float64`` 不会报错但会被当成乱码解释
+    （实测同一批角点 float32/float64 画出的像素量不同）。
+    """
     img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR) if gray.ndim == 2 else gray.copy()
     if det.found and det.image_points is not None:
-        cv2.drawChessboardCorners(img, tuple(int(v) for v in spec.pattern_size),
-                                  det.image_points, det.found)
+        want = int(np.prod(spec.pattern_size))
+        pts = np.asarray(det.image_points, dtype=np.float32).reshape(-1, 1, 2)
+        if len(pts) == want:
+            cv2.drawChessboardCorners(
+                img, tuple(int(v) for v in spec.pattern_size), pts, True)
     return img
 
 

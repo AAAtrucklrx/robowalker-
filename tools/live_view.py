@@ -377,6 +377,9 @@ def main() -> int:
                     help="显示最大宽度（0=不缩放；默认 0）")
     ap.add_argument("--max-h", type=int, default=DEFAULT_MAX_H,
                     help="显示最大高度（0=不缩放；默认 0）")
+    ap.add_argument("--log-every", type=float, default=5.0,
+                    help="每几秒往终端打一行心跳（fps/帧号/内存）。"
+                         "排查'程序跑到一半死机'时靠它留下最后状态；0=关闭")
     ap.add_argument("--display", default="tk", choices=["tk", "cv", "none"],
                     help="显示后端。tk(默认)=Tkinter，绕开 OpenCV 的 Qt 后端；"
                          "cv=OpenCV HighGUI（本机实测会 futex 死锁，慎用）；"
@@ -438,6 +441,8 @@ def main() -> int:
     _last_probe: dict = {"t": 0.0, "hint": ""}        # 子规格探测节流 + 上次提示
     fps_t, fps_n, fps = time.monotonic(), 0, 0.0
     focus_dirty = False
+    n_frames = 0
+    log_t = time.monotonic()
 
     try:
         for f in cap.frames(None, latest=True):
@@ -542,6 +547,23 @@ def main() -> int:
             if show_help:
                 put("s save | +/- exposure | ]/[ gain | b detect | "
                     "r reset focus | h help | q quit", 5, (200, 200, 200))
+
+            n_frames += 1
+            # 心跳：万一后面挂死，这行就是"最后活着的状态"（配合 --log-every）
+            if args.log_every > 0 and now - log_t >= args.log_every:
+                log_t = now
+                try:
+                    rss = 0
+                    with open("/proc/self/status") as fh:
+                        for ln in fh:
+                            if ln.startswith("VmRSS"):
+                                rss = int(ln.split()[1])
+                                break
+                except OSError:
+                    rss = 0
+                print(f"  [心跳] 帧={n_frames} fps={fps:4.1f} "
+                      f"板={'OK' if board_ok else '--'} focus={fs:6.1f} "
+                      f"exp={exposure:.0f} RSS={rss/1024:.0f}MB", flush=True)
 
             viewer.show(disp)
             k = viewer.key()
