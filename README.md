@@ -516,6 +516,10 @@ abcd 0000 713d aabf | 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000 0000
 | `compare_with_ros.py` | **与成熟工具对比**：ROS `camera_calibration` 无头标定 + **投影函数级**对比 + 半径分布 +（合成数据）**真值裁决** |
 | `setup_ros_bypass.sh` | **免 sudo** 抽出 ROS `camera_calibration` 到 `third_party/roscc`（不需要 topic / GUI / 相机，缓存 .deb 可离线重建） |
 | `hunt_board.py` | **不用弹窗找板子**：连拍一组后自动试各种规格，附带曝光判定 |
+| `live_view.py` | **实时取景**：曝光判定 + **对焦评分**（拧对焦环看它冲最大）+ 标定板检测；默认 Tkinter 后端（绕开 OpenCV Qt 的死锁） |
+| `camera_features.py` | **相机参数总览**：按 GenICam SFNC 名逐个探测（aravis Python 绑定没有 feature 枚举接口），含 8 项标定关键检查 |
+| `reset_usb_camera.py` | **兜底**：USB 复位卡死的相机（不需要 root）。相机层已能自愈，通常不用手动跑 |
+| `stress_gui.py` | GUI 稳定性压力测试（排查显示后端死锁时用） |
 | `selftest_intrinsics.py` | C1 两层自检（点级验数学 / 图像级验端到端） |
 | `selftest_pipeline.py` | C1+C2+C3 五项自检（含手眼约定校验、模拟器导数精度） |
 | `selftest_capture.py` | 采集工具**离线整链路自测**（伪造 H7 串口 + 真实 UVC 相机） |
