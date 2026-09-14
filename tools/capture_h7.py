@@ -312,12 +312,50 @@ def main() -> int:
 
     # ── IMU ────────────────────────────────────────────────
     print(f"打开 IMU {args.serial} @ {args.baud} ...")
+
+    # ⚠️ 先分清"设备不存在"和"存在但没权限"—— 这两种的修法完全不同。
+    # 实测踩过：IMU 被拔掉时 pyserial 报的是 **"Permission denied"**，
+    # 于是脚本提示"把用户加进 dialout 组"，完全指向错误方向（用户白折腾）。
+    if not Path(args.serial).exists():
+        print(f"❌ 串口 {args.serial} **不存在**。")
+        print("   ⚠️ 这**不是权限问题** —— 设备根本没枚举出来。请依次确认：")
+        print("     ① IMU 的 USB 线插好了吗？")
+        print("        lsusb | grep 0483   → 应看到 H7_IMU_With_EKF")
+        print("     ② 设备名对吗？（换个 USB 口常常会变成 ttyACM1）")
+        print("        ls /dev/ttyACM*")
+        print("     ③ lsusb 里能看到、但 /dev 里没有 → cdc_acm 没绑定，拔插一次即可。")
+        try:
+            from serial.tools import list_ports
+            # ttyS* 是内核的 31 个平台占位口（description 为 "n/a"），
+            # 全列出来会把真正有用的信息淹掉 —— 实测刷了满屏。
+            ports = [p for p in list_ports.comports()
+                     if not p.device.startswith("/dev/ttyS")
+                     or (p.description and p.description != "n/a")]
+            if ports:
+                print("   当前系统上可能的串口：")
+                for p in ports:
+                    print(f"     {p.device}  {p.description}")
+            else:
+                print("   当前系统上**没有任何 USB 串口** —— 基本可以确定是 IMU 没插上。")
+        except Exception:                       # noqa: BLE001
+            pass
+        return 2
+
     try:
         imu = H7Imu(args.serial, args.baud, keep_raw=True)
     except Exception as e:  # noqa: BLE001
+        msg = str(e)
         print(f"❌ 打不开串口：{e}")
-        print("   若提示权限不足：把用户加进 dialout 组并重新登录，")
-        print("   或执行 sudo bash tools/setup_permissions.sh 写入 udev 规则。")
+        if "permission" in msg.lower() or "denied" in msg.lower():
+            print("   → 是**权限**问题（设备在，但当前用户读不了）。修法：")
+            print("     ① 把用户加进 dialout 组后**重新登录**：")
+            print("        sudo usermod -aG dialout $USER")
+            print("     ② 或写 udev 规则（立刻生效，无需重登）：")
+            print("        sudo bash tools/setup_permissions.sh")
+        else:
+            print("   → 设备存在但打不开。检查是否被别的程序占用：")
+            print(f"        fuser -v {args.serial}")
+            print("        （同时只能有一个程序读串口；关掉别的 capture_h7/串口助手）")
         return 2
     imu.start()
     collector = ImuCollector(imu)
