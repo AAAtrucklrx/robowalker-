@@ -51,6 +51,13 @@ from camera import open_camera                    # noqa: E402
 from exposure import exposure_stats               # noqa: E402
 from target_detect import BoardSpec, detect       # noqa: E402
 
+# 大于目标规格的常见子规格，用于"还需退后多少"的提示（由大到小试）
+# 探测"能检出的最大子规格"时按这个顺序试（覆盖得开，不是简单降序）。
+# 顺序很关键：板子被裁切时真正能检出的是偏小的规格；若从 10x7 一路顺序
+# 往下试，还没轮到 6x4 就用完 max_tries 了（实测踩过），得到的提示会变成
+# "连 4x3 都检不出"，反而误导。
+_SUB_PATTERNS = [(11, 8), (9, 6), (8, 5), (6, 4), (4, 3), (5, 4), (10, 7)]
+
 # 显示缩放：默认**自动探测屏幕分辨率**，能放下就 1:1 显示。
 # 为什么不固定缩到 1280：缩放本身就是一次重采样，会把画面**二次模糊**，
 # 而对焦判断恰恰依赖画面锐度 —— 为了塞进窗口而牺牲锐度是帮倒忙。
@@ -146,6 +153,50 @@ def _norm_tk(keysym: str) -> str | None:
     if keysym in m:
         return m[keysym]
     return keysym if len(keysym) == 1 else None
+
+
+def _probe_largest_pattern(img, spec, want, max_tries: int = 4):
+    """目标规格没检出时，找**能检出的最大子规格**，用于提示"还要退后多少"。
+
+    为什么不自己估方格像素：试过"扫描线游程中位数"，在有透视/倾斜时
+    严重失真（实测 131 px vs 真值 204 px）。用**真正的检测器**去试几个
+    小规格，结果一定可信 —— 代价是每次约 70 ms，所以调用方要抽稀
+    （见 ``--probe-every``）。
+
+    返回 ``(cols, rows, image_points)`` 或 ``None``。
+    """
+    from target_detect import BoardSpec, detect as _detect
+
+    tried = 0
+    for (c, r) in _SUB_PATTERNS:
+        if (c, r) == tuple(want):
+            continue
+        if tried >= max_tries:
+            break
+        tried += 1
+        try:
+            d = _detect(img, BoardSpec("chessboard", (c, r), spec.square_size),
+                        allow_classic=False)
+        except Exception:                       # noqa: BLE001
+            continue
+        if d.found and d.image_points is not None:
+            return (c, r, d.image_points)
+    return None
+
+
+def _backoff_hint(img_w: int, want_cols: int, sub) -> str:
+    """由检出的子规格算"还需把距离拉大多少倍"。"""
+    c, r, pts = sub
+    p = pts.reshape(-1, 2)
+    if c < 2:
+        return ""
+    cell_px = (p[:, 0].max() - p[:, 0].min()) / (c - 1)
+    # want_cols 是**内角点**数 → 板子横向有 want_cols+1 个方格
+    # （11 个内角点 = 12 个方格）。要求整板加边距落在画面 90% 宽度内。
+    need_px = img_w * 0.90 / max(1, want_cols + 1)
+    if cell_px <= need_px:
+        return f"（已能检出 {c}x{r}，但整体构图仍需调整）"
+    return f"（最大只检出 {c}x{r}，还需退后约 {cell_px / need_px:.1f}x）"
 
 
 class CvViewer:
@@ -311,6 +362,13 @@ def main() -> int:
     ap.add_argument("--frame-rate", type=float, default=10.0)
     ap.add_argument("--pattern", default="11x8", help="内角点，如 11x8；none 关闭")
     ap.add_argument("--square-mm", type=float, default=20.0)
+    ap.add_argument("--detect-scale", type=float, default=0.5,
+                    help="检测前把图缩小到几倍（0.5=半分辨率）。SB 在 "
+                         "1624x1240 上要 70~250 ms，缩小 2 倍约快 4 倍；"
+                         "角点坐标会换算回原图，不影响绘制精度")
+    ap.add_argument("--probe-every", type=float, default=3.0,
+                    help="目标规格没检出时，每隔几秒探测一次"
+                         "'能检出的最大子规格'用于提示退后倍数（0=关闭）")
     ap.add_argument("--detect-every", type=int, default=2,
                     help="每 N 帧检测一次标定板（1=每帧；SB 单次约 71 ms，"
                          "10 fps 下不建议设 1）")
@@ -377,11 +435,12 @@ def main() -> int:
     n_saved = 0
     n_seen = 0
     _last_det: dict = {"found": False, "pts": None}   # 检测结果缓存（见下）
+    _last_probe: dict = {"t": 0.0, "hint": ""}        # 子规格探测节流 + 上次提示
     fps_t, fps_n, fps = time.monotonic(), 0, 0.0
     focus_dirty = False
 
     try:
-        for f in cap.frames(None):
+        for f in cap.frames(None, latest=True):
             img = f.image
             now = time.monotonic()
             fps_n += 1
@@ -397,6 +456,12 @@ def main() -> int:
             st = exposure_stats(img)
             exp_ok = st["verdict"] == "ok"
 
+            # 检测用的小图（只做一次缩放，下面检测和探测共用）
+            _small = (cv2.resize(img, None, fx=args.detect_scale,
+                                 fy=args.detect_scale,
+                                 interpolation=cv2.INTER_AREA)
+                      if args.detect_scale < 1.0 else img)
+
             # 显示用图（BGR，可缩放）
             disp = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR) if img.ndim == 2 \
                 else img.copy()
@@ -409,9 +474,10 @@ def main() -> int:
                 # 曝光统计 6 ms 就逼近 100 ms），显示会明显掉帧。
                 # 检测结果在间隔内沿用上一帧，视觉上几乎无感。
                 if n_seen % max(1, args.detect_every) == 0:
-                    d = detect(img, spec, allow_classic=False)
+                    d = detect(_small, spec, allow_classic=False)
                     _last_det["found"] = bool(d.found and d.image_points is not None)
-                    _last_det["pts"] = (d.image_points.copy()
+                    # 角点坐标要**换回原图尺度**，否则画上去会缩在左上角
+                    _last_det["pts"] = ((d.image_points / args.detect_scale).copy()
                                         if d.image_points is not None else None)
                 n_seen += 1
                 if _last_det["found"] and _last_det["pts"] is not None:
@@ -425,7 +491,21 @@ def main() -> int:
                     board_txt = (f"board=OK {args.pattern} "
                                  f"({len(pts)}pts, {frac:.0f}% width)")
                 else:
+                    # 目标规格没检出时，抽稀地探测"能检出的最大子规格"，
+                    # 直接告诉用户"还要退后多少" —— 否则只能靠反复试。
                     board_txt = "board=NOT FOUND <-- aim at the board"
+                    if (args.probe_every > 0
+                            and now - _last_probe["t"] >= args.probe_every):
+                        _last_probe["t"] = now
+                        sub = _probe_largest_pattern(_small, spec,
+                                                     spec.pattern_size)
+                        if sub is not None:
+                            sub = (sub[0], sub[1], sub[2] / args.detect_scale)
+                        _last_probe["hint"] = (
+                            _backoff_hint(img.shape[1], spec.pattern_size[0], sub)
+                            if sub else "（连 4x3 都检不出：先对准/调焦/调曝光）")
+                    if _last_probe["hint"]:
+                        board_txt += "  " + _last_probe["hint"]
 
             if scale < 1.0:
                 disp = cv2.resize(disp, None, fx=scale, fy=scale,

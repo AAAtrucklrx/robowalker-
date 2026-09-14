@@ -484,9 +484,23 @@ class HikCamera:
         shape = (h, w, 3) if n_ch == 3 else (h, w)
         return np.array(raw.reshape(shape), copy=True, order="C")
 
-    def frames(self, n: int | None = None, timeout_us: int = 2_000_000
-               ) -> Iterator[Frame]:
-        """产出帧。``n=None`` 表示一直取（调用方负责 break）。"""
+    def frames(self, n: int | None = None, timeout_us: int = 2_000_000,
+               latest: bool = False) -> Iterator[Frame]:
+        """产出帧。``n=None`` 表示一直取（调用方负责 break）。
+
+        ⚠️ ``latest``：**实时取景必须开，采集绝不能开**
+        ------------------------------------------------------------------
+        流里默认有 8 块缓冲。消费者（显示 + 检测）比生产者（相机）慢时，
+        队列会积压，而 ``timeout_pop_buffer`` 返回的是**最旧**的那一帧 ——
+        于是画面稳定地落后好几帧。实测用户在 8 fps 下体感延迟"比较严重"。
+
+        ``latest=True`` 时会在拿到一帧后**把积压的旧帧全部丢弃**，只保留
+        最新的，从而把延迟压到一帧以内。
+
+        **但采集（capture_h7）必须用默认的 False** —— 那里每一帧都要带
+        自己的时间戳存下来，丢帧会直接破坏数据集。这两个场景的需求正好相反，
+        所以做成显式开关而不是改默认值。
+        """
         A = self.Aravis
         if self.stream is None:
             self.configure()
@@ -508,6 +522,19 @@ class HikCamera:
                         f"取帧超时（{timeout_us/1e6:.1f}s）。可能原因：相机被别的"
                         f"进程占用、USB 链路不稳、或曝光+帧率组合超过带宽。"
                     )
+                if latest:
+                    # 把已经就绪的旧帧全部丢回流水线，只留下最新的一帧
+                    while True:
+                        extra = self.stream.try_pop_buffer()
+                        if extra is None:
+                            break
+                        if extra.get_status() == A.BufferStatus.SUCCESS:
+                            self.stream.push_buffer(buf)   # 旧的归还
+                            buf = extra                     # 换成更新的
+                        else:
+                            self.n_missing += 1
+                            self.stream.push_buffer(extra)
+
                 status = buf.get_status()
                 if status == A.BufferStatus.SUCCESS:
                     self.n_ok += 1
