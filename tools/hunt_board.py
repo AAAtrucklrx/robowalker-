@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "calib"))
 
 from camera import open_camera  # noqa: E402
+from exposure import exposure_stats, format_hint  # noqa: E402
 from target_detect import BoardSpec, detect  # noqa: E402
 
 # 常见规格（内角点）。含用户说的 12x9 方格 -> 11x8 内角点，以及"12x9 内角点"的情况
@@ -66,6 +67,7 @@ def main() -> int:
         print(f"手动模式：每转一个方向停一下、按回车拍一张，共 {args.n} 张。")
 
     paths = []
+    exposure_bad = []
     try:
         for k in range(args.n):
             if not args.auto:
@@ -79,6 +81,12 @@ def main() -> int:
             cv2.imwrite(str(p), f.image)
             paths.append(p)
             print(f"     已存 {p.name}  mean={f.image.mean():5.1f}")
+            # 曝光判定比均值有用得多：2026-09-14 那次整场采集就是因为过曝报废，
+            # 而当时只打印了 mean=225.5 —— 看起来像个正常数字，没人会起疑。
+            _st = exposure_stats(f.image)
+            if _st["verdict"] != "ok":
+                print("     " + format_hint(_st, args.exposure))
+                exposure_bad.append(_st["verdict"])
             if args.auto:
                 time.sleep(args.interval)
     finally:
@@ -109,10 +117,20 @@ def main() -> int:
     print()
     if any_hit:
         print("🎉 找到板子了 —— 用上面报告的 --pattern 参数重跑 capture_h7.py 即可。")
+        if exposure_bad:
+            print(f"   ⚠️  但有 {len(exposure_bad)} 帧曝光不合格"
+                  f"（{exposure_bad[0]}）—— 正式采集前先按上面的建议调曝光。")
     else:
         print("❌ 这一组里一帧都没检出。请打开")
         print(f"     {out}/000.png")
         print("   看一眼相机到底在拍什么，确认：")
+        # 曝光问题优先说 —— 它是"板子明明在画面里却检不出"的头号原因，
+        # 而且调一个参数就能解决，比怀疑板子/距离/对焦省事得多。
+        if exposure_bad:
+            print(f"   ⚠️ **先解决曝光**：{len(exposure_bad)}/{len(paths)} 帧曝光不合格"
+                  f"（{exposure_bad[0]}）。")
+            print("      过曝会让白格与背景一起顶到 255，角点检测直接失效；")
+            print(f"      把 --exposure 从 {args.exposure:.0f} µs 往下调再看。")
         print("   ① 板子真的在镜头前方（不是背面/侧面）；")
         print("   ② 板子占画面 1/3 以上（太远角点太小）；")
         print("   ③ 板子没被反光/阴影糊掉；")

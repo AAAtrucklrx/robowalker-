@@ -75,6 +75,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "calib"))
 
 from camera import open_camera  # noqa: E402
+from exposure import exposure_stats  # noqa: E402
 from imu_h7 import H7Imu, validate  # noqa: E402
 from target_detect import BoardSpec  # noqa: E402
 
@@ -363,6 +364,8 @@ def main() -> int:
                                          args.square_mm / 1000.0))
         print(f"深度多样性监测已开启（板 {args.board_type} {args.pattern}）")
 
+    exp_bad: list = []          # 曝光不合格的帧（见 calib/exposure.py）
+
     def save_one(frame) -> None:
         nonlocal idx
         import cv2
@@ -371,6 +374,15 @@ def main() -> int:
         cv2.imwrite(str(out / "images" / name), frame.image)
         cam_ts_rows.append({"frame": idx, "filename": name,
                             "host_ts": frame.host_ts, "device_ts": frame.device_ts})
+        # 曝光不合格**当场**报，不要等到标定时才发现整场数据不能用。
+        # 2026-09-14 那次采集全废在过曝上，而当时没有任何提示。
+        st = exposure_stats(frame.image)
+        if st["verdict"] != "ok":
+            exp_bad.append((name, st["verdict"]))
+            print(f"     ⚠️  {name} 曝光不合格：{st['verdict']} "
+                  f"(mean={st['mean']:.1f} 饱和={st['sat_hi']*100:.1f}%)"
+                  f"  → 建议把 --exposure {args.exposure:.0f} 改成约 "
+                  f"{args.exposure*st['suggest_exposure_factor']:.0f} µs")
         idx += 1
         if tracker is not None:
             tracker.offer(frame.image)
@@ -412,8 +424,17 @@ def main() -> int:
                        f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f})"
                        f"{span_txt}{board_txt}"
                        + ("  TOO SLOW!" if warn else ""))
+                # 曝光同样实时显示：过曝时"板子检不出来"会被误判成对焦/距离问题，
+                # 而真正的修法只是调一个曝光参数。
+                est = exposure_stats(f.image)
+                exp_warn = est["verdict"] != "ok"
+                if exp_warn:
+                    txt += "  " + ("TOO BRIGHT!" if est["verdict"] == "too_bright"
+                                   else "TOO DARK!" if est["verdict"] == "too_dark"
+                                   else "LOW CONTRAST!")
+                color = (0, 0, 255) if (warn or exp_warn) else (0, 220, 0)
                 cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 0, 255) if warn else (0, 220, 0), 2)
+                            color, 2)
                 cv2.imshow("capture (s save / a auto / q quit)", disp)
                 k = cv2.waitKey(1) & 0xFF
                 if k == ord("s"):
@@ -431,6 +452,16 @@ def main() -> int:
         imu.close()
 
     rep = tracker.report() if tracker is not None else None
+    # 曝光不合格的帧要在**采集结束时**再汇总一次：单帧提示会被滚动输出冲掉，
+    # 而它的后果是"整场数据不可用"，必须让人在离开前看到。
+    if exp_bad:
+        kinds = sorted({v for _, v in exp_bad})
+        rep = ((rep + "\n") if rep else "") + "\n".join([
+            f"⚠️  曝光不合格 {len(exp_bad)}/{idx} 帧（{'/'.join(kinds)}）",
+            "     过曝会让白格与背景一起顶到 255，角点检测直接失效 ——",
+            "     这是 2026-09-14 那次采集整场报废的原因。",
+            f"     建议把 --exposure 从 {args.exposure:.0f} µs 回调后重采。",
+        ])
     write_outputs(out, collector.frames, bytes(imu.raw), cam_info, cam_ts_rows, rep)
     return 0
 
