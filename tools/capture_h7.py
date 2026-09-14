@@ -170,7 +170,11 @@ class BoardTracker:
                               interpolation=cv2.INTER_AREA)
         try:
             from target_detect import detect
-            d = detect(gray, self.spec)
+            # allow_classic=False：这是**实时反馈**路径，只要 SB 的 71 ms 快路径。
+            # 默认参数在"没找到板子"时会回退到经典检测器（684 ms @ 全分辨率），
+            # 而"没找到"正是瞄准/对焦时最常见的状态 —— 会让采集界面一顿一顿的。
+            # 实时提示少检出一帧无所谓（下一轮还会测）。
+            d = detect(gray, self.spec, allow_classic=False)
         except Exception:  # noqa: BLE001
             return None
         if not d.found or d.image_points is None:

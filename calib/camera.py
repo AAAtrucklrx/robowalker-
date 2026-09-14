@@ -505,17 +505,25 @@ class HikCamera:
                 status = buf.get_status()
                 if status == A.BufferStatus.SUCCESS:
                     self.n_ok += 1
-                    yield Frame(
-                        image=self._decode(buf),
-                        host_ts=self._wall_ns_to_mono(buf.get_system_timestamp()),
-                        device_ts=buf.get_timestamp() or None,
-                        frame_id=k,
-                    )
+                    # 先在**归还之前**把像素拷出来（_decode 内部 copy），
+                    # 归还之后这块内存就不属于我们了。
+                    image = self._decode(buf)
+                    host_ts = self._wall_ns_to_mono(buf.get_system_timestamp())
+                    device_ts = buf.get_timestamp() or None
+                    # ★ 归还**同一个** buffer，而不是新分配一个。
+                    #   这是 aravis 的标准用法（pop → 处理 → push 回去），
+                    #   缓冲区在流水线里循环复用。原实现每次 push 一块新的
+                    #   `Buffer.new_allocate(payload)`，等于每帧都让 2 MB 内存
+                    #   走一遍 malloc/free —— 10 Hz 下每秒 20 MB 的堆churn，
+                    #   既浪费又显著增加触发堆损坏的机会（本项目已经因为
+                    #   堆问题崩过好几次）。
+                    self.stream.push_buffer(buf)
                     k += 1
+                    yield Frame(image=image, host_ts=host_ts,
+                                device_ts=device_ts, frame_id=k - 1)
                 else:
                     self.n_missing += 1
-                # 归还缓冲，保持流水线不断
-                self.stream.push_buffer(A.Buffer.new_allocate(self._payload))
+                    self.stream.push_buffer(buf)
         finally:
             if started_here:
                 try:

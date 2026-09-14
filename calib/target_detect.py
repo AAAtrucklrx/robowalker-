@@ -135,7 +135,7 @@ def _reorder_to_match_detector(op: np.ndarray, spec: BoardSpec, detector: str):
 
 
 def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
-                      refine: bool = True) -> Detection:
+                      refine: bool = True, allow_classic: bool = True) -> Detection:
     """检测棋盘格内角点，返回**角点与 3D 点已正确配对**的检测结果。
 
     优先用 ``findChessboardCornersSB``（OpenCV 4.x 的 sector-based 检测器，
@@ -144,6 +144,25 @@ def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
 
     返回的 ``object_points`` 已经按检测器的顺序重排过，调用方（内参标定、
     PnP）直接配对即可，**不要再自己反序**。
+
+    ⚠️ ``allow_classic``：一个**必须在实时场景关掉**的性能陷阱
+    ------------------------------------------------------------------
+    实测（1624x1240）：
+
+    ============================================  =========
+    ``findChessboardCornersSB``                   **71 ms**
+    ``findChessboardCorners``（经典）              **684 ms**
+    ``detect()`` 完整（SB 失败 → 回退经典）        **919 ms**
+    ============================================  =========
+
+    也就是说**板子没找到的时候反而慢 13 倍**（71 → 919 ms），因为那时才回退到
+    经典检测器。而"板子没找到"正是**实时取景一边瞄准一边看**的状态 ——
+    最需要流畅的时候偏偏卡成 ~1 fps，**看起来就像"相机帧率太低"**。
+
+    所以：**离线标定**（``run_calibration``）保留回退 —— 多找回几帧是有价值
+    的，900 ms 一帧无所谓；**实时取景 / 采集反馈**必须传
+    ``allow_classic=False`` 只走 SB 快路径。少检测一帧对实时提示无害
+    （下一帧还会再测），但卡顿会直接毁掉瞄准与对焦体验。
     """
     ps = tuple(int(v) for v in spec.pattern_size)
     op = spec.object_points()
@@ -158,6 +177,8 @@ def detect_chessboard(gray: np.ndarray, spec: BoardSpec,
             return Detection(True, c,
                              _reorder_to_match_detector(op, spec, "SB"),
                              method="SB")
+        if not allow_classic:
+            return Detection(False, None, None, method="SB")
 
     ok, corners = cv2.findChessboardCorners(gray, ps, flags=_classic_flags())
     if not ok:
@@ -225,11 +246,14 @@ def detect_charuco(gray: np.ndarray, spec: BoardSpec) -> Detection:
 # ══════════════════════════════════════════════════════════════
 #  统一入口
 # ══════════════════════════════════════════════════════════════
-def detect(gray: np.ndarray, spec: BoardSpec) -> Detection:
+def detect(gray: np.ndarray, spec: BoardSpec,
+           allow_classic: bool = True) -> Detection:
+    """检测标定板。``allow_classic=False`` 走快路径（实时场景用，见
+    :func:`detect_chessboard` 的性能说明）。"""
     if gray.ndim == 3:
         gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
     if spec.type == "chessboard":
-        return detect_chessboard(gray, spec)
+        return detect_chessboard(gray, spec, allow_classic=allow_classic)
     if spec.type == "charuco":
         return detect_charuco(gray, spec)
     raise ValueError(f"未知标定板类型 {spec.type}")

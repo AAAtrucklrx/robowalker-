@@ -120,6 +120,9 @@ def main() -> int:
     ap.add_argument("--frame-rate", type=float, default=10.0)
     ap.add_argument("--pattern", default="11x8", help="内角点，如 11x8；none 关闭")
     ap.add_argument("--square-mm", type=float, default=20.0)
+    ap.add_argument("--detect-every", type=int, default=2,
+                    help="每 N 帧检测一次标定板（1=每帧；SB 单次约 71 ms，"
+                         "10 fps 下不建议设 1）")
     ap.add_argument("--save-dir", default="/tmp/live")
     ap.add_argument("--max-w", type=int, default=DEFAULT_MAX_W,
                     help="显示最大宽度（0=不缩放；默认 0）")
@@ -170,6 +173,8 @@ def main() -> int:
     show_help = True
     best_focus = 0.0
     n_saved = 0
+    n_seen = 0
+    _last_det: dict = {"found": False, "pts": None}   # 检测结果缓存（见下）
     fps_t, fps_n, fps = time.monotonic(), 0, 0.0
     scale = None
     focus_dirty = False
@@ -199,20 +204,30 @@ def main() -> int:
                 else img.copy()
 
             board_txt, board_ok = "board=off", False
+            last_corners = None
             if detect_on and spec is not None:
-                d = detect(img, spec)
-                if d.found and d.image_points is not None:
+                # 隔 --detect-every 帧才检测一次：SB 单次 ~71 ms，10 fps 时
+                # 每帧都跑就吃掉 71% 的一帧预算（再叠加对焦评分 8 ms +
+                # 曝光统计 6 ms 就逼近 100 ms），显示会明显掉帧。
+                # 检测结果在间隔内沿用上一帧，视觉上几乎无感。
+                if n_seen % max(1, args.detect_every) == 0:
+                    d = detect(img, spec, allow_classic=False)
+                    _last_det["found"] = bool(d.found and d.image_points is not None)
+                    _last_det["pts"] = (d.image_points.copy()
+                                        if d.image_points is not None else None)
+                n_seen += 1
+                if _last_det["found"] and _last_det["pts"] is not None:
                     board_ok = True
-                    pts = d.image_points.reshape(-1, 2)
-                    # 在**原始尺寸**上画，之后整体缩放，避免坐标换算出错
-                    cv2.drawChessboardCorners(
-                        disp, spec.pattern_size, d.image_points, True)
+                    pts = _last_det["pts"].reshape(-1, 2)
+                    if len(pts) == int(np.prod(spec.pattern_size)):
+                        cv2.drawChessboardCorners(disp, spec.pattern_size,
+                                                  _last_det["pts"], True)
                     span_x = pts[:, 0].max() - pts[:, 0].min()
                     frac = span_x / img.shape[1] * 100
                     board_txt = (f"board=OK {args.pattern} "
                                  f"({len(pts)}pts, {frac:.0f}% width)")
                 else:
-                    board_txt = f"board=NOT FOUND <-- aim at the board"
+                    board_txt = "board=NOT FOUND <-- aim at the board"
 
             if scale < 1.0:
                 disp = cv2.resize(disp, None, fx=scale, fy=scale,
