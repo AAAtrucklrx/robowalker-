@@ -9,7 +9,15 @@
 # 所以把 .deb 抽出来、加进 PYTHONPATH 就能用，不需要 root、不需要 ROS topic、
 # 不需要 GUI、不需要相机。
 #
-# 副作用：只往 apt 缓存和 /tmp/roscc 里写东西，卸载就是 rm -rf /tmp/roscc。
+# 为什么装在项目里而不是 /tmp（这里踩过坑）
+# ------------------------------------------------------------------
+# 最初 DEST=/tmp/roscc。结果 /tmp 被系统清理后，`compare_with_ros.py` 直接
+# 报"用不了 camera_calibration"——**而它是"与成熟工具对比"这项验证的唯一入口**，
+# 静默失效等于验收时少一项。
+# 现在改成两条保险：
+#   1. DEST 默认落在项目内的 third_party/roscc，跟项目一起备份；
+#   2. 下载的 .deb **缓存**在 third_party/roscc/cache/，重装/换机时断网也能重建。
+# 卸载就是 rm -rf third_party/roscc。
 #
 # 用法：
 #   bash tools/setup_ros_bypass.sh
@@ -18,14 +26,26 @@
 
 set -euo pipefail
 
-DEST="${ROS_CC_DEST:-/tmp/roscc}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="${ROS_CC_DEST:-$ROOT/third_party/roscc}"
+CACHE="$DEST/cache"
+PKG_REL="ex/opt/ros/jazzy/lib/python3.12/site-packages"
 
-echo "=== 1. 下载并解包 camera_calibration 到 $DEST ==="
-rm -rf "$DEST"; mkdir -p "$DEST"; cd "$DEST"
-apt-get download ros-jazzy-camera-calibration
-dpkg -x ./*.deb ex
-PKG_PATH="$DEST/ex/opt/ros/jazzy/lib/python3.12/site-packages"
+echo "=== 1. 准备 camera_calibration 到 $DEST ==="
+mkdir -p "$CACHE"
+
+# 已有缓存的 .deb 就直接复用（断网可用），否则才去源上拉。
+if compgen -G "$CACHE/*.deb" > /dev/null; then
+    echo "  ✅ 复用缓存：$(basename "$(ls "$CACHE"/*.deb | head -1)")"
+else
+    echo "  ⬇️  缓存为空，从源下载（仅此一次，之后断网也能重建）"
+    ( cd "$CACHE" && apt-get download ros-jazzy-camera-calibration )
+fi
+
+# 只重建 ex/，**不动 cache/**，否则每次都要重新下载。
+rm -rf "$DEST/ex"
+( cd "$DEST" && dpkg -x "$CACHE"/*.deb ex )
+PKG_PATH="$DEST/$PKG_REL"
 [ -d "$PKG_PATH" ] || { echo "❌ 解包后找不到 python 包目录: $PKG_PATH" >&2; exit 1; }
 echo "  ✅ $PKG_PATH"
 
@@ -53,10 +73,13 @@ fi
 
 echo
 echo "=== 4. 自检 ==="
-PYTHONPATH="$PKG_PATH:/opt/ros/jazzy/lib/python3.12/site-packages:$ROOT/.venv/lib/python3.12/site-packages" \
-  "$ROOT/.venv/bin/python" - <<'PY'
+# 这里必须用 $PKG_PATH，不能写死路径 —— 之前写死了 /tmp/roscc，
+# 于是改了 DEST 之后自检仍然去看旧路径，测的不是真正会用到的那份。
+PYTHONPATH="$PKG_PATH:/opt/ros/jazzy/lib/python3.12/site-packages" \
+LD_LIBRARY_PATH="/opt/ros/jazzy/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$ROOT/.venv/bin/python" - <<PY
 import sys
-sys.path.insert(0, "/tmp/roscc/ex/opt/ros/jazzy/lib/python3.12/site-packages")
+sys.path.insert(0, r"$PKG_PATH")
 sys.path.insert(0, "/opt/ros/jazzy/lib/python3.12/site-packages")
 try:
     from camera_calibration.calibrator import MonoCalibrator, ChessboardInfo
@@ -73,7 +96,7 @@ cat <<EOF
 用法（不需要 source ROS，脚本内部会处理路径）：
 
   .venv/bin/python tools/compare_with_ros.py \\
-      --session data/session_01 --pattern 9x6 --square-mm 25
+      --session data/session_01 --pattern 11x8 --square-mm 20
 
 它会：
   1. 用 ROS 自己的 collect_corners 检测角点（**独立检测，不是复用我们的**）；
@@ -81,5 +104,5 @@ cat <<EOF
   3. 与我们的 C1 结果做**投影函数级**对比（在视锥里撒点，比像素差），
      而不是只比 fx/fy 那几个数 —— 后者看不出畸变系数的相互抵消。
 
-若换了机器或想重来：rm -rf $DEST 后重跑本脚本。
+若想重来：rm -rf "$DEST" 后重跑本脚本（缓存没了才会再联网）。
 EOF

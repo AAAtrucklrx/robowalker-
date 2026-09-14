@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 data/
 results/
+# ROS camera_calibration 旁路：ex/ 是解包产物，可随时从 cache/ 里的 .deb 重建；
+# cache/ 的 .deb 只有 79 KB，**故意提交**，这样换机器或断网也能重建对照环境。
+third_party/roscc/ex/
