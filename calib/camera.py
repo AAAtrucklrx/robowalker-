@@ -139,6 +139,12 @@ def list_devices() -> list[dict]:
 _USB_WEDGE_SIGNS = (
     "write_memory error", "LIBUSB_ERROR_BUSY", "PixelFormat_Reg",
     "Failed to claim USB control interface",
+    # 这个是在"上一个进程刚释放、下一个进程立刻打开"时出现的（实测：
+    # 前一个 live_view 收到 SIGTERM 干净退出后，紧接着启动的进程报
+    # `Failed to bootstrap USB device ... (3)`）。同属设备没完全恢复，
+    # 复位一下就好 —— 不列进来的话自动恢复不会触发。
+    "Failed to bootstrap",
+    "read_memory timeout",
 )
 _USB_VENDOR, _USB_PRODUCT = "2bdf", "0001"   # Hikrobot U3V
 USBDEVFS_RESET = 0x5514                       # _IO('U', 20)

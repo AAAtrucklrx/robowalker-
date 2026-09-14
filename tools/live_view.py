@@ -211,6 +211,7 @@ class TkViewer:
         self.label = tk.Label(self.root, borderwidth=0)
         self.label.pack()
         self._photo = None            # ← 见类文档第 1 点，必须持有
+        self._photo_size = None
         self._key: str | None = None
         self.closed = False
         self.root.bind("<Key>", self._on_key)
@@ -229,13 +230,35 @@ class TkViewer:
             import cv2
             bgr = cv2.resize(bgr, None, fx=self.scale, fy=self.scale,
                              interpolation=cv2.INTER_AREA)
-        img = Image.fromarray(bgr[:, :, ::-1])       # BGR→RGB，零拷贝视图
-        self._photo = self.ImageTk.PhotoImage(img)
-        self.label.configure(image=self._photo)
+        # np.ascontiguousarray 是必要的：bgr[:, :, ::-1] 是**负步长视图**，
+        # PIL 的 fromarray 直接吃它可能拿到错位的数据。
+        arr = np.ascontiguousarray(bgr[:, :, ::-1])       # BGR→RGB
+        im = Image.fromarray(arr)
+
+        if self._photo is None or im.size != self._photo_size:
+            # 只在第一帧（或尺寸变了）创建 Tk 图像。
+            #
+            # ⚠️ 这里是**内存泄漏的关键**：早先的实现每帧都
+            # ``ImageTk.PhotoImage(im)`` 新建一个 Tk 图像。Tk 的
+            # ``image delete`` 是**延迟**到解释器空闲时才执行的，而我们的
+            # 循环几乎不让它空闲 —— 于是 Tk 图像不断堆积。实测 RSS
+            # 30 s 内从 385 MB 涨到 471 MB（约 2.9 MB/s），几分钟就能吃掉
+            # 几个 GB，最后显示层自己出错退出。
+            # 正确做法是**只建一次**，之后用 ``paste`` 原地更新内容。
+            self._photo = self.ImageTk.PhotoImage(im)
+            self._photo_size = im.size
+            self.label.configure(image=self._photo)
+        else:
+            self._photo.paste(im)          # 原地更新，不新建 Tk 图像
+
         try:
             self.root.update_idletasks()
             self.root.update()
-        except self.tk.TclError:
+        except self.tk.TclError as e:
+            # 别静默退出 —— 之前这里默默置 closed，导致"跑一会儿自己就没了"
+            # 却完全不知道原因。
+            print(f"  ⚠️  显示刷新失败（TclError: {e}），窗口可能已关闭",
+                  flush=True)
             self.closed = True
 
     def key(self) -> str | None:
