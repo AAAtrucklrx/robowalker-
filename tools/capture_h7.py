@@ -152,6 +152,7 @@ class BoardTracker:
         self.sizes: list[float] = []
         self.n_seen = 0
         self.n_detected = 0
+        self.last_ok: bool | None = None   # 最近一次检测是否看到板子
 
     def offer(self, image) -> float | None:
         """喂一帧（可以随便喂，内部按 every 抽稀）。返回当前的 sqrt(area)。"""
@@ -172,7 +173,9 @@ class BoardTracker:
         except Exception:  # noqa: BLE001
             return None
         if not d.found or d.image_points is None:
+            self.last_ok = False
             return None
+        self.last_ok = True
         p = d.image_points.reshape(-1, 2)
         area = float((p[:, 0].ptp()) * (p[:, 1].ptp()))
         self.n_detected += 1
@@ -398,8 +401,16 @@ def main() -> int:
                 warn = bool(idx > 3 and gdps < MIN_GYRO_DPS)
                 span = tracker.depth_span() if tracker is not None else float("nan")
                 span_txt = (f"  depth={span:.1f}x" if np.isfinite(span) else "")
+                if tracker is None:
+                    board_txt = ""
+                elif tracker.last_ok is None:
+                    board_txt = "  board=?"
+                else:
+                    board_txt = ("  board=OK" if tracker.last_ok
+                                 else "  board=NOT FOUND <-- aim at the board")
                 txt = (f"saved={idx} auto={'ON' if auto else 'off'}  "
-                       f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f}){span_txt}"
+                       f"gyro={gdps:5.1f}deg/s (need>{TARGET_GYRO_DPS:.0f})"
+                       f"{span_txt}{board_txt}"
                        + ("  TOO SLOW!" if warn else ""))
                 cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             (0, 0, 255) if warn else (0, 220, 0), 2)
