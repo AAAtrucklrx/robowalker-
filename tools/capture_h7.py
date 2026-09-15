@@ -80,6 +80,23 @@ from viewer import make_viewer  # noqa: E402
 from imu_h7 import H7Imu, validate  # noqa: E402
 from target_detect import BoardSpec  # noqa: E402
 
+# 「引导式自动采集」的阶段表：(阶段名, 秒数, 屏幕提示(英文), 终端提示(中文))
+#
+# 为什么要有这个模式：一个人又要手持相机做动作、又要盯屏幕按键，实际做不到
+# （用户原话："我一个人有些难操纵"）。所以把"什么时候开始存、该做什么动作、
+# 什么时候结束"全部自动化，用户只管跟着提示做动作。
+#
+# 屏幕提示**必须是英文**：cv2.putText 用 Hershey 字体，画不了中文（会变成
+# 一串 "?"）。详细中文提示走终端。
+AUTO_PHASES = [
+    ("WAIT",   0.0,  "WAITING: get board=OK", "把板子摆进画面，等 board=OK（会自动开始）"),
+    ("STATIC", 3.0,  "HOLD STILL  <-- now",   "① 保持**完全静止** 3 秒（陀螺零偏标定，别动！）"),
+    ("ROTATE", 20.0, "ROTATE FAST x/y/z",     "② 绕 x/y/z 三轴**快速转动**（看 gyro 冲到 90+）"),
+    ("DEPTH",  20.0, "MOVE NEAR <-> FAR",     "③ 板子**走近、走远**（看 depth 涨到 2.0x 以上）"),
+    ("ANGLE",  15.0, "TILT: all 4 corners",   "④ 换**倾角**，让板子走遍画面四角+中心"),
+    ("DONE",   0.0,  "DONE - saving...",      "✅ 采集完成，正在落盘"),
+]
+
 IMU_HEADER = ("# timestamp gx gy gz ax ay az   "
               "(s, rad/s x3, m/s^2 x3; timestamp = 主机单调时钟)")
 FULL_HEADER = "t_board_ms,t_host_s,gx,gy,gz,ax,ay,az,roll,pitch,yaw,qw,qx,qy,qz"
@@ -284,6 +301,10 @@ def main() -> int:
         description="Camera-IMU 数据集采集（工业 U3V 相机 / UVC + H7 IMU）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--auto-session", action="store_true",
+                    help="**引导式自动采集**：board=OK 后自动开始存帧，"
+                         "按时间在屏幕上提示该做什么动作，做完自动结束。"
+                         "一个人操作时用这个（不用腾手按键）")
     ap.add_argument("--display", default="tk", choices=["tk", "cv", "none"],
                     help="取景窗口后端。tk(默认)=Tkinter，稳；"
                          "cv=OpenCV HighGUI（本机实测会 futex 死锁，窗口变黑"
@@ -362,13 +383,40 @@ def main() -> int:
             print(f"        fuser -v {args.serial}")
             print("        （同时只能有一个程序读串口；关掉别的 capture_h7/串口助手）")
         return 2
-    imu.start()
-    collector = ImuCollector(imu)
-    collector.start()
-    time.sleep(0.4)
-    if imu.n_frames == 0:
-        print("❌ 串口打开成功但收不到数据。排查：python3 calib/imu_h7.py --port <串口>")
-        collector.stop(); imu.close()
+    # 打开成功 ≠ 能收到数据：设备**正在重新枚举**时，open() 会成功，
+    # 但后续 read() 抛 "device reports readiness to read but returned no
+    # data (device disconnected or multiple access on port?)"。
+    # 实测撞上过（IMU 刚从 Device 008 变成 017，我的 USB 复位也会触发）。
+    # 这不是真故障，重试一两次就好 —— 直接报错会让用户白折腾一轮。
+    imu = None
+    collector = None
+    for attempt in range(3):
+        try:
+            if imu is not None:
+                try:
+                    imu.close()
+                except Exception:               # noqa: BLE001
+                    pass
+            imu = H7Imu(args.serial, args.baud, keep_raw=True)
+            imu.start()
+            collector = ImuCollector(imu)
+            collector.start()
+            time.sleep(0.5)
+            if imu.n_frames > 0:
+                break
+            print(f"  ⚠️  串口打开但收不到数据（设备可能正在重新枚举），"
+                  f"重试 {attempt+1}/3 ...", flush=True)
+            collector.stop()
+        except Exception as e:                  # noqa: BLE001
+            print(f"  ⚠️  第 {attempt+1} 次打开失败：{type(e).__name__}: {e}",
+                  flush=True)
+        time.sleep(1.0)
+    else:
+        print("❌ 三次都没能收到 IMU 数据。排查：")
+        print(f"     python3 calib/imu_h7.py --port {args.serial} --seconds 3")
+        print("     若它也报 'device reports readiness ... multiple access'：")
+        print("       · 换个 USB 口，或拔插一次 IMU；")
+        print("       · 确认没有别的程序读同一串口（fuser -v " + args.serial + "）。")
         return 2
     print(f"IMU 已在收数据（{imu.n_frames} 帧 / {imu.n_bytes} 字节）")
 
@@ -458,17 +506,66 @@ def main() -> int:
             print(f"（窗口后端：{args.display}）\n")
             print(f"采集要点：开头静置 3 秒 → 绕三轴快速转动"
                   f"（目标 ≥{TARGET_GYRO_DPS:.0f}°/s）→ 小幅平移 → 板走遍画面")
-            auto = False
+            auto = bool(args.auto_session)     # 引导模式下一开始就自动存
             last_auto = 0.0
+            # ── 引导式自动采集的状态机 ──────────────────────────────
+            ph = 0                       # 当前阶段下标
+            ph_t0 = time.monotonic()
+            wait_ok_since = None         # board=OK 连续开始的时刻
+            last_cue_s = -1              # 终端倒计时用
+            if args.auto_session:
+                print("\n" + "=" * 68)
+                print("引导式自动采集：下面每一步我会提示你做什么，跟着做就行")
+                print("=" * 68)
+                print(f"  {AUTO_PHASES[0][3]}")
             while True:
                 f = next(frame_iter)
                 now = time.monotonic()
-                if auto and now - last_auto >= args.auto_interval:
-                    save_one(f); last_auto = now
                 disp = cv2.cvtColor(f.image, cv2.COLOR_GRAY2BGR) \
                     if f.image.ndim == 2 else f.image.copy()
                 if tracker is not None:
                     tracker.offer(f.image)
+
+                # ── 阶段推进（必须在决定"要不要存"之前算好）──────────
+                cue = ""
+                if args.auto_session:
+                    name, dur, scr, zh = AUTO_PHASES[ph]
+                    board_now = bool(tracker is not None and tracker.last_ok)
+                    if name == "WAIT":
+                        # 等 board=OK 连续 1 秒再开始，避免恰好一帧误检就开跑
+                        if board_now:
+                            wait_ok_since = wait_ok_since or now
+                            if now - wait_ok_since >= 1.0:
+                                ph = 1; ph_t0 = now; last_cue_s = -1
+                                print(f"\n>>> {AUTO_PHASES[1][3]}", flush=True)
+                        else:
+                            wait_ok_since = None
+                    else:
+                        left = dur - (now - ph_t0)
+                        if left <= 0:
+                            ph += 1
+                            ph_t0 = now; last_cue_s = -1
+                            if AUTO_PHASES[ph][0] == "DONE":
+                                print(f"\n>>> {AUTO_PHASES[ph][3]}", flush=True)
+                                break
+                            print(f"\n>>> {AUTO_PHASES[ph][3]}", flush=True)
+                        else:
+                            s_left = int(left) + 1
+                            if s_left != last_cue_s and s_left % 5 == 0:
+                                last_cue_s = s_left
+                                print(f"    ...还剩 {s_left:3d}s  "
+                                      f"{AUTO_PHASES[ph][3]}", flush=True)
+                    name, dur, scr, zh = AUTO_PHASES[ph]
+                    left = max(0.0, dur - (now - ph_t0)) if dur else 0.0
+                    cue = (f"{scr}" + (f"  [{left:4.1f}s]" if dur else ""))
+                    # 引导模式下不存 WAIT 阶段的帧（还没开始）
+                    if name == "WAIT":
+                        auto = False
+                    else:
+                        auto = True
+
+                if auto and now - last_auto >= args.auto_interval:
+                    save_one(f); last_auto = now
                 gdps = collector.recent_gyro_dps()
                 warn = bool(idx > 3 and gdps < MIN_GYRO_DPS)
                 span = tracker.depth_span() if tracker is not None else float("nan")
@@ -493,8 +590,19 @@ def main() -> int:
                                    else "TOO DARK!" if est["verdict"] == "too_dark"
                                    else "LOW CONTRAST!")
                 color = (0, 0, 255) if (warn or exp_warn) else (0, 220, 0)
-                cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                cv2.putText(disp, txt, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             color, 2)
+                if cue:
+                    # 动作提示画在**底部居中、大号加底框** —— 手持时要能
+                    # 隔一段距离扫一眼就看懂现在该干什么。
+                    (tw, th), _ = cv2.getTextSize(cue, cv2.FONT_HERSHEY_SIMPLEX,
+                                                  1.1, 3)
+                    x = max(10, (disp.shape[1] - tw) // 2)
+                    y = disp.shape[0] - 30
+                    cv2.rectangle(disp, (x - 12, y - th - 12),
+                                  (x + tw + 12, y + 12), (0, 0, 0), -1)
+                    cv2.putText(disp, cue, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                                1.1, (0, 255, 255), 3, cv2.LINE_AA)
                 viewer.show(disp)
                 k = viewer.key()
                 if k in ("q", "Escape") or getattr(viewer, "closed", False):
