@@ -50,6 +50,7 @@ sys.path.insert(0, str(ROOT / "calib"))
 from camera import open_camera                    # noqa: E402
 from exposure import exposure_stats               # noqa: E402
 from target_detect import BoardSpec, detect       # noqa: E402
+from viewer import make_viewer, _screen_size      # noqa: E402
 
 # 大于目标规格的常见子规格，用于"还需退后多少"的提示（由大到小试）
 # 探测"能检出的最大子规格"时按这个顺序试（覆盖得开，不是简单降序）。
@@ -85,26 +86,6 @@ def _install_signal_handlers() -> None:
             pass
 
 
-def _screen_size() -> tuple[int, int] | None:
-    """尽力探测主屏分辨率；失败返回 None（调用方退化为不缩放）。"""
-    import re
-    import shutil
-    import subprocess
-
-    if shutil.which("xrandr"):
-        try:
-            out = subprocess.run(["xrandr"], capture_output=True, text=True,
-                                 timeout=5).stdout
-            for line in out.splitlines():
-                if " connected" in line:
-                    m = re.search(r"(\d+)x(\d+)\+", line)
-                    if m:
-                        return int(m.group(1)), int(m.group(2))
-        except Exception:                       # noqa: BLE001
-            pass
-    return None
-
-
 def focus_score(gray: np.ndarray, crop: bool = True) -> float:
     """对焦评分：Laplacian 方差。越大越清晰。
 
@@ -131,28 +112,6 @@ def _fit(shape, max_w: int, max_h: int) -> float:
     if max_h > 0:
         cands.append(max_h / h)
     return min(cands)
-
-
-def _norm_cv(k: int) -> str | None:
-    """把 ``cv2.waitKey`` 的返回值规范化成按键名。"""
-    if k in (-1, 0xFF):
-        return None
-    if k == 27:
-        return "Escape"
-    try:
-        return chr(k)
-    except ValueError:
-        return None
-
-
-def _norm_tk(keysym: str) -> str | None:
-    """把 tkinter 的 keysym 规范化成与 :func:`_norm_cv` 同一套名字。"""
-    m = {"plus": "+", "equal": "=", "minus": "-", "underscore": "_",
-         "bracketright": "]", "bracketleft": "[", "Escape": "Escape",
-         "KP_Add": "+", "KP_Subtract": "-"}
-    if keysym in m:
-        return m[keysym]
-    return keysym if len(keysym) == 1 else None
 
 
 def _probe_largest_pattern(img, spec, want, max_tries: int = 4):
@@ -201,156 +160,6 @@ def _backoff_hint(img_w: int, want_cols: int, sub) -> str:
     if cell_px <= need_px:
         return f"(found {c}x{r}, adjust framing)"
     return f"(max {c}x{r}, back off ~{cell_px / need_px:.1f}x)"
-
-
-class CvViewer:
-    """OpenCV HighGUI 显示。
-
-    ⚠️ 本机 OpenCV 4.11 的 GUI 后端是 **QT5**（``GTK+: NO``，换不了），
-    实测在"两帧之间间隔较长"时会出现 **futex 死锁**：窗口变黑、关不掉、
-    进程 28 线程 81% CPU 卡在 ``futex_do_wait``。所以默认不用它。
-    """
-
-    name = "cv"
-
-    def __init__(self, title: str, gui_normal: bool = False):
-        import cv2
-        self.cv2 = cv2
-        self.title = title
-        self.win = title
-        if gui_normal:
-            cv2.namedWindow(self.win, cv2.WINDOW_GUI_NORMAL)
-
-    def show(self, bgr) -> None:
-        self.cv2.imshow(self.win, bgr)
-
-    def key(self) -> str | None:
-        return _norm_cv(self.cv2.waitKey(1) & 0xFF)
-
-    def close(self) -> None:
-        try:
-            self.cv2.destroyWindow(self.win)
-        except Exception:                       # noqa: BLE001
-            pass
-        try:
-            self.cv2.destroyAllWindows()
-        except Exception:                       # noqa: BLE001
-            pass
-
-
-class TkViewer:
-    """Tkinter + Pillow 显示（**默认**）。
-
-    为什么默认换成 tkinter
-    ------------------------------------------------------------------
-    OpenCV 的 Qt 后端会死锁（见 :class:`CvViewer`），而 tkinter 是纯 Python
-    事件循环，``update()`` 由我们自己控制，不依赖 OpenCV 的 GUI 子系统，
-    也就没有那类"Qt 事件循环被饿死 → 窗口变黑 → 关不掉"的问题。
-
-    两个必须注意的点：
-
-    1. ``ImageTk.PhotoImage`` **必须保住引用**（``self._photo``）。不保引用的话
-       对象被 GC 掉，窗口会显示成**空白/黑色** —— 这正好也是"黑屏"的一种成因。
-    2. 关闭窗口要绑 ``WM_DELETE_WINDOW``，否则点 × 只会销毁窗口而循环还在跑。
-    """
-
-    name = "tk"
-
-    def __init__(self, title: str, scale: float = 1.0):
-        import tkinter as tk
-        from PIL import Image, ImageTk
-        self.tk, self.Image, self.ImageTk = tk, Image, ImageTk
-        self.scale = scale
-        self.root = tk.Tk()
-        self.root.title(title)
-        self.label = tk.Label(self.root, borderwidth=0)
-        self.label.pack()
-        self._photo = None            # ← 见类文档第 1 点，必须持有
-        self._photo_size = None
-        self._key: str | None = None
-        self.closed = False
-        self.root.bind("<Key>", self._on_key)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.focus_force()
-
-    def _on_key(self, event) -> None:
-        self._key = _norm_tk(event.keysym)
-
-    def _on_close(self) -> None:
-        self.closed = True
-
-    def show(self, bgr) -> None:
-        from PIL import Image
-        if self.scale < 1.0:
-            import cv2
-            bgr = cv2.resize(bgr, None, fx=self.scale, fy=self.scale,
-                             interpolation=cv2.INTER_AREA)
-        # np.ascontiguousarray 是必要的：bgr[:, :, ::-1] 是**负步长视图**，
-        # PIL 的 fromarray 直接吃它可能拿到错位的数据。
-        arr = np.ascontiguousarray(bgr[:, :, ::-1])       # BGR→RGB
-        im = Image.fromarray(arr)
-
-        if self._photo is None or im.size != self._photo_size:
-            # 只在第一帧（或尺寸变了）创建 Tk 图像。
-            #
-            # ⚠️ 这里是**内存泄漏的关键**：早先的实现每帧都
-            # ``ImageTk.PhotoImage(im)`` 新建一个 Tk 图像。Tk 的
-            # ``image delete`` 是**延迟**到解释器空闲时才执行的，而我们的
-            # 循环几乎不让它空闲 —— 于是 Tk 图像不断堆积。实测 RSS
-            # 30 s 内从 385 MB 涨到 471 MB（约 2.9 MB/s），几分钟就能吃掉
-            # 几个 GB，最后显示层自己出错退出。
-            # 正确做法是**只建一次**，之后用 ``paste`` 原地更新内容。
-            self._photo = self.ImageTk.PhotoImage(im)
-            self._photo_size = im.size
-            self.label.configure(image=self._photo)
-        else:
-            self._photo.paste(im)          # 原地更新，不新建 Tk 图像
-
-        try:
-            self.root.update_idletasks()
-            self.root.update()
-        except self.tk.TclError as e:
-            # 别静默退出 —— 之前这里默默置 closed，导致"跑一会儿自己就没了"
-            # 却完全不知道原因。
-            print(f"  ⚠️  显示刷新失败（TclError: {e}），窗口可能已关闭",
-                  flush=True)
-            self.closed = True
-
-    def key(self) -> str | None:
-        k, self._key = self._key, None
-        return k
-
-    def close(self) -> None:
-        try:
-            self.root.destroy()
-        except Exception:                       # noqa: BLE001
-            pass
-
-
-class NullViewer:
-    """无窗口（``--display none``）：只跑逻辑，供自动化测试用。"""
-
-    name = "none"
-
-    def __init__(self, title: str, **_):
-        self.closed = False
-
-    def show(self, bgr) -> None:
-        pass
-
-    def key(self) -> str | None:
-        return None
-
-    def close(self) -> None:
-        pass
-
-
-def _make_viewer(kind: str, title: str, scale: float):
-    if kind == "tk":
-        return TkViewer(title, scale=scale)
-    if kind == "cv":
-        return CvViewer(title)
-    return NullViewer(title)
 
 
 def main() -> int:
@@ -433,7 +242,7 @@ def main() -> int:
 
     # 显示缩放比：这里就按**配置的分辨率**算出来，因为 TkViewer 构造时就要用。
     scale = _fit((args.height, args.width), args.max_w, args.max_h)
-    viewer = _make_viewer(args.display, "live view (q / Esc to quit)", scale)
+    viewer = make_viewer(args.display, "live view (q / Esc to quit)", scale)
 
     exposure = float(args.exposure)
     gain = float(args.gain)

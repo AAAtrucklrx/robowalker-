@@ -76,6 +76,7 @@ sys.path.insert(0, str(ROOT / "calib"))
 
 from camera import open_camera  # noqa: E402
 from exposure import exposure_stats  # noqa: E402
+from viewer import make_viewer  # noqa: E402
 from imu_h7 import H7Imu, validate  # noqa: E402
 from target_detect import BoardSpec  # noqa: E402
 
@@ -283,6 +284,10 @@ def main() -> int:
         description="Camera-IMU 数据集采集（工业 U3V 相机 / UVC + H7 IMU）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--display", default="tk", choices=["tk", "cv", "none"],
+                    help="取景窗口后端。tk(默认)=Tkinter，稳；"
+                         "cv=OpenCV HighGUI（本机实测会 futex 死锁，窗口变黑"
+                         "且关不掉，慎用）；none=不要窗口")
     ap.add_argument("--serial", default="/dev/ttyACM0", help="IMU 串口")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--camera-source", default="hik",
@@ -445,6 +450,12 @@ def main() -> int:
         else:
             import cv2
             print("\n交互模式：s=存一帧  a=自动连拍  q=结束")
+            # 用共享的 viewer（默认 Tkinter）—— OpenCV HighGUI 在本机是 Qt
+            # 后端，实测会 futex 死锁：窗口变黑且关不掉。采集过程中窗口一挂，
+            # 整个采集就白做了，所以这里必须用稳的那个。
+            viewer = make_viewer(args.display, "capture (s save / a auto / q quit)",
+                                 1.0)
+            print(f"（窗口后端：{args.display}）\n")
             print(f"采集要点：开头静置 3 秒 → 绕三轴快速转动"
                   f"（目标 ≥{TARGET_GYRO_DPS:.0f}°/s）→ 小幅平移 → 板走遍画面")
             auto = False
@@ -484,16 +495,16 @@ def main() -> int:
                 color = (0, 0, 255) if (warn or exp_warn) else (0, 220, 0)
                 cv2.putText(disp, txt, (8, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                             color, 2)
-                cv2.imshow("capture (s save / a auto / q quit)", disp)
-                k = cv2.waitKey(1) & 0xFF
-                if k == ord("s"):
+                viewer.show(disp)
+                k = viewer.key()
+                if k in ("q", "Escape") or getattr(viewer, "closed", False):
+                    break
+                if k == "s":
                     save_one(f)
-                elif k == ord("a"):
+                elif k == "a":
                     auto = not auto
                     print(f"自动连拍 {'开' if auto else '关'}")
-                elif k == ord("q"):
-                    break
-            cv2.destroyAllWindows()
+            viewer.close()
     finally:
         if cap is not None:
             cap.close()
