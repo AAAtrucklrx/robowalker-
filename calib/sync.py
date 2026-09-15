@@ -198,10 +198,30 @@ def estimate_offset(cam_times: np.ndarray, cam_R: np.ndarray,
 # ══════════════════════════════════════════════════════════════
 #  IMU 预处理（C3 也要用）
 # ══════════════════════════════════════════════════════════════
+def _despike(x: np.ndarray, width: int = 7) -> np.ndarray:
+    """中位滤波去掉**孤立尖峰**（不改动其余样本）。
+
+    为什么必须做：实测真机数据里，静止段每秒都会出现若干个**单帧**尖峰
+    （例如连续值 ``[1.44 1.45 15.33 1.79 1.89]`` —— 孤立一帧跳到 15.3 °/s）。
+    这类尖峰把 0.2 s 滚动窗口的标准差撑爆，于是**整段真正的静止被判成运动**，
+    最终静止段 0 样本、零偏标定直接放弃。
+    实测（session_01 前 12 s）：原实现 0 帧；中位滤波(7) 后恢复 **6901 帧
+    = 6.9 s**。中位滤波只影响"判静止"这一步，不动原始数据。
+    """
+    from scipy.signal import medfilt
+
+    x = np.asarray(x, float)
+    if x.ndim == 1:
+        return medfilt(x, width)
+    return np.stack([medfilt(x[:, k], width) for k in range(x.shape[1])], axis=1)
+
+
 def static_segment(t: np.ndarray, accel: np.ndarray, gyro: np.ndarray,
                    accel_std_max: float = 0.05, gyro_std_max: float = 0.02,
                    min_duration_s: float = 1.0,
-                   window_s: float = 0.2) -> np.ndarray:
+                   window_s: float = 0.2,
+                   despike: bool = True,
+                   despike_width: int = 7) -> np.ndarray:
     """找出"完全静止"的样本（布尔掩码）。
 
     静止段是零偏标定与重力对齐的**唯一**可靠来源，所以采集时开头务必静置 2 秒。
@@ -216,10 +236,20 @@ def static_segment(t: np.ndarray, accel: np.ndarray, gyro: np.ndarray,
     1. 窗口按**秒**算（默认 0.2 s），不同采样率下行为一致；
     2. 阈值收紧（默认 0.05 m/s² / 0.02 rad/s）；
     3. **只保留连续时长 ≥ ``min_duration_s`` 的段** —— 零散的短窗不算静止。
+
+    ⚠️ 后来又踩了第二个坑：真机 IMU 流里每秒都有**孤立单帧尖峰**
+    （见 :func:`_despike`），滚动标准差被撑爆 → **真静止被判成运动**，
+    于是"静止段 0 样本"。现在判静止前先中位滤波去尖峰（``despike=True``），
+    实测把 0 帧恢复成 6.9 s。
     """
     t = np.asarray(t, float)
     a = np.asarray(accel, float)
     g = np.asarray(gyro, float)
+    if despike:
+        # 只在**判静止**时用去尖峰版本；返回的掩码索引对应原始数据，
+        # 零偏仍从原始数据取（但用稳健统计量，见 estimate_bias）。
+        a = _despike(a, despike_width)
+        g = _despike(g, despike_width)
     n = len(t)
     if n < 16:
         return np.zeros(n, bool)
@@ -279,8 +309,10 @@ def estimate_bias(t: np.ndarray, accel: np.ndarray, gyro: np.ndarray,
                 "reason": f"静止段占了 {frac*100:.1f}% 的数据 —— 标定采集本来就"
                           f"要让人动起来，这不合理，说明静止判据把运动数据也吞了。"
                           f"已放弃零偏标定（不减零偏比减错零偏差）"}
-    a_m = a[mask].mean(axis=0)
-    g_m = g[mask].mean(axis=0)
+    # 用**中位数**而不是均值取零偏：均值会被残留的孤立尖峰拉偏，而零偏是要
+    # 从后面每一帧里减掉的量，偏一点就整体污染。中位数对少量离群点免疫。
+    a_m = np.median(a[mask], axis=0)
+    g_m = np.median(g[mask], axis=0)
     g_dir = a_m / np.linalg.norm(a_m)
     accel_bias = a_m - g_dir * 9.80665
     return {
