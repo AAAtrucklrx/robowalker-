@@ -432,8 +432,15 @@ def main() -> int:
     try:
         if args.frames > 0:
             print(f"无窗口模式：抓 {args.frames} 帧 ...")
-            for _ in range(args.frames):
+            # 每 10 帧打一次进度：无窗口模式下屏幕上没有任何反馈，
+            # 而采集需要用户**按时间做动作**（先静止、再快速转动、再拉深度）。
+            # 有进度条才能对上节奏。
+            _t0 = time.monotonic()
+            for _i in range(args.frames):
                 save_one(next(frame_iter))
+                if _i % 10 == 0 or _i == args.frames - 1:
+                    print(f"    已抓 {_i+1}/{args.frames} 帧  "
+                          f"（已用 {time.monotonic()-_t0:5.1f}s）", flush=True)
                 time.sleep(args.frame_interval)
         else:
             import cv2

@@ -194,9 +194,13 @@ def _backoff_hint(img_w: int, want_cols: int, sub) -> str:
     # want_cols 是**内角点**数 → 板子横向有 want_cols+1 个方格
     # （11 个内角点 = 12 个方格）。要求整板加边距落在画面 90% 宽度内。
     need_px = img_w * 0.90 / max(1, want_cols + 1)
+    # ⚠️ 必须返回**英文**：cv2.putText 用的是 Hershey 字体，只能画 ASCII，
+    # 中文会原样变成一串 "?"（实测窗口里显示成
+    # "board=NOT FOUND ?????? 4x3 ??????..."，完全不可读）。
+    # 详细的中文解释走终端（见 main 里的打印）。
     if cell_px <= need_px:
-        return f"（已能检出 {c}x{r}，但整体构图仍需调整）"
-    return f"（最大只检出 {c}x{r}，还需退后约 {cell_px / need_px:.1f}x）"
+        return f"(found {c}x{r}, adjust framing)"
+    return f"(max {c}x{r}, back off ~{cell_px / need_px:.1f}x)"
 
 
 class CvViewer:
@@ -425,10 +429,11 @@ def main() -> int:
     print(f"  快照目录 {out}")
     print("=" * 68)
     print("按键：s 存图  +/- 曝光  ]/[ 增益  b 开关板检测  r 重置对焦峰值  h 帮助  q 退出")
+    print("（窗口内只用英文：OpenCV 的 putText 画不了中文，中文提示会走这个终端）")
 
     # 显示缩放比：这里就按**配置的分辨率**算出来，因为 TkViewer 构造时就要用。
     scale = _fit((args.height, args.width), args.max_w, args.max_h)
-    viewer = _make_viewer(args.display, "live view (q to quit, Esc 同)", scale)
+    viewer = _make_viewer(args.display, "live view (q / Esc to quit)", scale)
 
     exposure = float(args.exposure)
     gain = float(args.gain)
@@ -438,7 +443,7 @@ def main() -> int:
     n_saved = 0
     n_seen = 0
     _last_det: dict = {"found": False, "pts": None}   # 检测结果缓存（见下）
-    _last_probe: dict = {"t": 0.0, "hint": ""}        # 子规格探测节流 + 上次提示
+    _last_probe: dict = {"t": 0.0, "hint": "", "sub": None}   # 子规格探测 + 提示
     fps_t, fps_n, fps = time.monotonic(), 0, 0.0
     focus_dirty = False
     n_frames = 0
@@ -505,10 +510,34 @@ def main() -> int:
                         sub = _probe_largest_pattern(_small, spec,
                                                      spec.pattern_size)
                         if sub is not None:
+                            # 坐标换回原图尺度，下面要用它画角点
                             sub = (sub[0], sub[1], sub[2] / args.detect_scale)
-                        _last_probe["hint"] = (
-                            _backoff_hint(img.shape[1], spec.pattern_size[0], sub)
-                            if sub else "（连 4x3 都检不出：先对准/调焦/调曝光）")
+                        _last_probe["sub"] = sub
+                        if sub:
+                            _last_probe["hint"] = _backoff_hint(
+                                img.shape[1], spec.pattern_size[0], sub)
+                        else:
+                            _last_probe["hint"] = "(nothing found: aim/focus/exposure)"
+                        # 中文详解打到终端（窗口里画不了中文）
+                        if _last_probe["hint"] != _last_probe.get("last_printed"):
+                            _last_probe["last_printed"] = _last_probe["hint"]
+                            if sub:
+                                print(f"  [提示] 板子未完整检出：最大只认出 "
+                                      f"{sub[0]}x{sub[1]}，请把相机/板子距离"
+                                      f"拉大或调整构图（见窗口 board= 那行）",
+                                      flush=True)
+                            else:
+                                print("  [提示] 连 4x3 都认不出：请先对准板子、"
+                                      "拧对焦环（看 focus= 冲到最大）、"
+                                      "并让 exposure 变绿", flush=True)
+                    # 把"能检出的最大子区域"的角点也画出来 —— 这是最直观的
+                    # 瞄准反馈：用户能直接看到相机锁住了板子的哪一块、还差多少。
+                    _sub = _last_probe.get("sub")
+                    if _sub is not None:
+                        _c, _r, _pts = _sub
+                        _pts = np.asarray(_pts, dtype=np.float32).reshape(-1, 1, 2)
+                        if len(_pts) == _c * _r:
+                            cv2.drawChessboardCorners(disp, (_c, _r), _pts, True)
                     if _last_probe["hint"]:
                         board_txt += "  " + _last_probe["hint"]
 
@@ -517,10 +546,12 @@ def main() -> int:
                                   interpolation=cv2.INTER_AREA)
 
             # ── 叠加文字 ──────────────────────────────────────────────
-            lh = 22
+            # 文字放大到 0.75 —— 用户是隔着一段距离手持看屏幕的，
+            # 0.55 太小看不清（实测反馈"看不出在说什么"）。
+            lh = 30
             def put(s, row, color=(0, 220, 0)):
-                cv2.putText(disp, s, (8, 24 + row * lh),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1,
+                cv2.putText(disp, s, (10, 32 + row * lh),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2,
                             cv2.LINE_AA)
 
             put(f"exp={exposure:.0f}us gain={gain:.0f}dB  "
