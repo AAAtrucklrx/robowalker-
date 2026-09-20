@@ -4,7 +4,11 @@ pip.pyz
 __pycache__/
 *.pyc
 data/
-results/
+# results/：旧的批量运行记录不入库，但**验证证据必须入库**
+results/*
+!results/bench_intrinsics.json
+!results/calibration_result.json
+!results/calibration_result.yaml
 # ROS camera_calibration 旁路：ex/ 是解包产物，可随时从 cache/ 里的 .deb 重建；
 # cache/ 的 .deb 只有 79 KB，**故意提交**，这样换机器或断网也能重建对照环境。
 third_party/roscc/ex/
