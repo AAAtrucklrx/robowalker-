@@ -41,6 +41,24 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def stamp_of(msg) -> float:
+    """取**消息头时间戳**（秒）。
+
+    ⚠️ 这是本工具最重要的一个细节。EuRoC 的 bag 里有两套时间：
+      · bag 录制时间（``reader.messages()`` 给的 ts）
+      · 消息头 ``msg.header.stamp`` ← **这个才是真实采样时刻**
+
+    实测（/imu0 前 400 条）：
+        bag 录制时间   步长中位  86.3 µs，标准差 **±14647 µs**  ← 完全混乱
+        header 时间戳  步长中位 **5000.1 µs**，标准差 **±0.1 µs** ← 精确 200 Hz
+
+    用 bag 时间的后果：C2 时间对齐彻底失效、C3 全废，**而且不会报错** ——
+    数据看着"有"，时间轴却是错的。所以这里必须用 header。
+    """
+    h = msg.header.stamp
+    return float(h.sec) + float(h.nanosec) * 1e-9
+
+
 def open_bag(bag: Path):
     from rosbags.highlevel import AnyReader
 
@@ -67,12 +85,6 @@ def convert(bag: Path, out: Path, cam_topic: str, imu_topic: str,
     用序号区分；默认 0。
     """
     import cv2
-    from rosbags.typesys import Stores, get_typestore
-
-    try:
-        typestore = get_typestore(Stores.ROS1_NOETIC)
-    except Exception:                                  # noqa: BLE001
-        typestore = None
 
     out.mkdir(parents=True, exist_ok=True)
     (out / "images").mkdir(exist_ok=True)
@@ -93,18 +105,13 @@ def convert(bag: Path, out: Path, cam_topic: str, imu_topic: str,
             if ts > t_end:
                 break
             msg = reader.deserialize(raw, conn.msgtype)
-            if typestore is not None:
-                try:
-                    msg = typestore.deserialize_ros1(raw, conn.msgtype)
-                except Exception:                      # noqa: BLE001
-                    pass
             h, w = int(msg.height), int(msg.width)
             enc = str(msg.encoding).lower()
             buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
             if enc in ("mono8", "8uc1"):
                 img = buf[: h * w].reshape(h, w)
             elif enc in ("bayer_rggb8", "bayer_bggr8", "bayer_gbrg8",
-                         "bayer_grbg8", "mono8"):
+                         "bayer_grbg8"):
                 # EuRoC 的 cam0/cam1 是 BayerRG8，转灰度（不做去马赛克，
                 # 因为标定只需要灰度角点，去马赛克反而引入插值模糊）
                 img = buf[: h * w].reshape(h, w)
@@ -116,7 +123,7 @@ def convert(bag: Path, out: Path, cam_topic: str, imu_topic: str,
                 img = buf[: h * w].reshape(h, w)
             name = f"{k:06d}.png"
             cv2.imwrite(str(out / "images" / name), img)
-            img_rows.append((name, ts / 1e9))
+            img_rows.append((name, stamp_of(msg)))
             k += 1
             if max_images and k >= max_images:
                 break
@@ -135,7 +142,7 @@ def convert(bag: Path, out: Path, cam_topic: str, imu_topic: str,
             msg = reader.deserialize(raw, conn.msgtype)
             g = msg.angular_velocity
             a = msg.linear_acceleration
-            imu_rows.append((ts / 1e9, g.x, g.y, g.z, a.x, a.y, a.z))
+            imu_rows.append((stamp_of(msg), g.x, g.y, g.z, a.x, a.y, a.z))
         print(f"  IMU 共 {len(imu_rows)} 条")
 
     if not img_rows:
@@ -175,6 +182,18 @@ def convert(bag: Path, out: Path, cam_topic: str, imu_topic: str,
         f"- 时间戳已整体平移到 0 起（相对关系不变）\n\n"
         f"⚠️ 靶标是 **AprilGrid**（6x6 AprilTag 36h11），不是棋盘格。\n"
     )
+    # ── 自动检查：IMU 步长必须均匀 ────────────────────────────
+    # 用 bag 录制时间会导致步长混乱（实测标准差 ±14.6 ms）。这类错误
+    # **不会报错、数据看着也有**，但时间轴是错的 → 必须自动拦住。
+    rel = np.median(d_imu)
+    jitter = float(np.std(d_imu) / max(rel, 1e-12))
+    print(f"\n时间戳检查：")
+    print(f"  IMU 步长中位 {rel*1e6:.1f} µs，相对抖动 {jitter*100:.2f}%")
+    if jitter > 0.05:
+        print(f"  ⚠️  抖动过大！可能用了 bag 录制时间而不是 header 时间戳")
+    else:
+        print(f"  ✅ 步长均匀（{1/rel:.1f} Hz）")
+
     print(f"\n✅ 已写入 {out}")
     print(f"   图像 {len(img_rows)} 张，帧间隔 {np.median(d_img)*1000:.2f} ms")
     print(f"   IMU {len(imu_rows)} 条，步长 {np.median(d_imu)*1e6:.1f} µs")

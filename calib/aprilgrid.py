@@ -127,10 +127,77 @@ def _dict(spec: AprilGridSpec):
     return getter(d) if getter else a.Dictionary_get(d)
 
 
+# 官方 apriltag 库的检测器缓存（构造很贵，别每帧新建）
+_AT_DETECTORS: dict = {}
+
+
+def _official_apriltag(gray: np.ndarray, spec: AprilGridSpec):
+    """用**官方 apriltag 库**检测，返回 [(id, 4x2 corners), ...] 或 None。
+
+    为什么必须用它而不是 OpenCV
+    ------------------------------------------------------------------
+    实测（本文件作者踩了整整一轮）：
+
+    * OpenCV 的 ``DICT_APRILTAG_36h11`` **检不出 Kalibr 的 AprilGrid 靶标** ——
+      在一张**完全干净的靶标渲染图**上检出 **0** 个；而用 OpenCV 自己
+      ``generateImageMarker`` 生成的 36h11 标记，自己检自己 **6/6 全对**。
+      ⇒ OpenCV 的检测器没坏，是它和 Kalibr 靶标的**渲染方式**不兼容。
+    * ``DetectorParameters.detectInvertedMarker`` **对 AprilTag 字典无效** ——
+      把 OpenCV 生成的标记反色后，开不开这个开关都检不出（只对 ArUco 生效）。
+    * 官方 ``apriltag`` 库（Kalibr 用的就是它）在实拍图上**正常**：
+      帧 1023 检出 7 个，**ID 唯一无重复**（OpenCV 的误检则会给出重复 ID）。
+
+    所以：AprilGrid 一律走官方库；检测不到再退回 OpenCV（聊胜于无，
+    但要注意它的结果可能含重复 ID 的误检，用之前必须查重）。
+    """
+    try:
+        import apriltag
+    except ImportError:
+        return None
+    fam = spec.family.replace("DICT_APRILTAG_", "tag").lower()
+    key = (fam, 1.5, 0.8)
+    d = _AT_DETECTORS.get(key)
+    if d is None:
+        try:
+            d = apriltag.Detector(apriltag.DetectorOptions(
+                families=fam, quad_decimate=1.5, quad_blur=0.8,
+                refine_edges=1))
+        except Exception:                                  # noqa: BLE001
+            return None
+        _AT_DETECTORS[key] = d
+    out = []
+    for r in d.detect(gray):
+        out.append((int(r.tag_id), np.asarray(r.corners, dtype=np.float64)))
+    return out
+
+
 def detect_aprilgrid(gray: np.ndarray, spec: AprilGridSpec,
                      corner_refine: bool = True) -> Detection:
-    """检测 AprilGrid，返回与棋盘格同构的 :class:`Detection`。"""
+    """检测 AprilGrid，返回与棋盘格同构的 :class:`Detection`。
+
+    优先用**官方 apriltag 库**（见 :func:`_official_apriltag` 的说明），
+    不可用时退回 OpenCV 的 aruco。
+    """
     import cv2
+
+    hits = _official_apriltag(gray, spec)
+    if hits is not None:
+        img_pts, obj_pts, used = [], [], []
+        for tid, c in hits:
+            try:
+                cx, cy = spec.tag_center(tid)
+            except ValueError:
+                continue                     # id 超出网格 → 误检
+            img_pts.append(c.astype(np.float32).reshape(-1, 2))
+            obj_pts.append(spec.tag_object_points(tid)
+                           + np.array([cx, cy, 0.0]))
+            used.append(tid)
+        if not img_pts:
+            return Detection(False, None, None, method="apriltag")
+        img = np.concatenate(img_pts, 0).astype(np.float32).reshape(-1, 1, 2)
+        obj = np.concatenate(obj_pts, 0).astype(np.float32)
+        return Detection(True, img, obj, method="apriltag",
+                         marker_ids=np.asarray(used, dtype=np.int32))
 
     a = cv2.aruco
     d = _dict(spec)
