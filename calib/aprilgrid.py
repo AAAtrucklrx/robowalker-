@@ -70,7 +70,7 @@ class AprilGridSpec:
     #   "row_major_tl": id = row*cols + col，row 0 是最上一行（左上角是 id 0）
     #   "col_major_bl": id = col*rows + row，row 0 是最下一行（左下角是 id 0）
     # 两种都是真实项目里用过的写法，谁对由重投影残差判定。
-    layout: str = "row_major_tl"
+    layout: str = "row_major_bl"
 
     @property
     def pitch(self) -> float:
@@ -87,7 +87,15 @@ class AprilGridSpec:
         n = self.tag_cols * self.tag_rows
         if not (0 <= tid < n):
             raise ValueError(f"tag id {tid} 超出 0..{n-1}")
-        if self.layout == "row_major_tl":
+        if self.layout == "row_major_bl":
+            # ⚠️ 实测确定：Kalibr 的 AprilGrid 里 **id 0 在最下面一行**，
+            # 向右递增、换行向上。曾按"row 0 在最上面"实现，结果 PnP 残差
+            # 高达 70 px（角速率算出来比陀螺大 15 倍，但重投影在归一化坐标下
+            # 只有 0.1 —— 单位也搞错了，见 verify_layout）。
+            # 用 RANSAC + 对称性枚举实测：flip_y 后内点残差 70→5.8 px。
+            row = self.tag_rows - 1 - (tid // self.tag_cols)
+            col = tid % self.tag_cols
+        elif self.layout == "row_major_tl":
             row = tid // self.tag_cols          # 0 = 最上面一行
             col = tid % self.tag_cols
         elif self.layout == "col_major_bl":
@@ -259,7 +267,7 @@ def verify_layout(gray_paths, spec: AprilGridSpec, K=None, dist=None,
     if try_all:
         # 把候选 layout 都试一遍，让**重投影残差**来决定哪个对。
         # 这样就不必依赖"我记得 Kalibr 是这么排的"。
-        cands = ["row_major_tl", "col_major_bl"]
+        cands = ["row_major_bl", "row_major_tl", "col_major_bl"]
         scored = []
         for lay in cands:
             sp = AprilGridSpec(spec.tag_cols, spec.tag_rows, spec.tag_size,
@@ -307,9 +315,13 @@ def verify_layout(gray_paths, spec: AprilGridSpec, K=None, dist=None,
             continue
         proj, _ = cv2.projectPoints(det.object_points, rvec, tvec, K0, d0)
         e = proj.reshape(-1, 2) - det.image_points.reshape(-1, 2)
-        res.append(float(np.sqrt((e ** 2).sum(axis=1).mean())))
+        res.append(float(np.sqrt((e ** 2).sum(axis=1).mean())) * K0[0, 0])
+    # ⚠️ `solvePnP(..., K=eye(3))` 的重投影残差是**归一化坐标**单位，不是像素！
+    # 这里乘 fx 换算成像素 —— 曾经直接把 0.1 当成 "0.1 px" 上报，实际是
+    # 0.1×420 = 42 px，把一个"拟合极差"的结果误判成"优秀"。
     return {"n_frames": len(res), "rms_px": float(np.mean(res)) if res else None,
-            "tags_per_frame": float(np.mean(n_tag)) if n_tag else 0.0}
+            "tags_per_frame": float(np.mean(n_tag)) if n_tag else 0.0,
+            "rms_norm": float(np.mean(res)) if res else None}
 
 
 if __name__ == "__main__":
